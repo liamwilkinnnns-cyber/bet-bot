@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import uuid
@@ -23,7 +24,15 @@ HEADERS = [
 ]
 
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+
+if os.getenv("GOOGLE_CREDS_JSON"):
+    # Read the whole JSON from the env var on Render
+    creds_dict = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+else:
+    # Fallback for running on your Mac
+    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+
 client = gspread.authorize(creds)
 
 # Open the spreadsheet by name, then the tab named "Bets"
