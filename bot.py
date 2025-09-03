@@ -2,7 +2,9 @@ import os
 import re
 import json
 import uuid
-from datetime import datetime
+import requests
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional, Tuple
 
 from dotenv import load_dotenv
@@ -15,15 +17,19 @@ from oauth2client.service_account import ServiceAccountCredentials
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+# API-Football (direct) key for auto event date (football only)
+APISPORTS_KEY = os.getenv("APISPORTS_KEY")  # add this in Render
+
 # ------------------ SHEETS SETUP ------------------
-SHEET_NAME = "Bet Tracker"  # Google spreadsheet file name
+SHEET_NAME = "Bet Tracker"  # Google spreadsheet name
 HEADERS = [
-    "ID", "Date Placed", "Tipster", "Selection", "Odds (dec)",
-    "Bookmaker", "Stake", "Status", "Return", "Profit", "Cumulative Profit"
+    "ID", "Date Placed", "Event Date", "Tipster", "Selection",
+    "Odds (dec)", "Bookmaker", "Stake", "Status", "Return",
+    "Profit", "Cumulative Profit"
 ]
 SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-# Prefer GOOGLE_CREDS_JSON (Render). Fallback to local credentials.json on your Mac.
+# Prefer GOOGLE_CREDS_JSON on hosts like Render. Fallback to local file on your Mac.
 if os.getenv("GOOGLE_CREDS_JSON"):
     creds_dict = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
     CREDS = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
@@ -40,12 +46,10 @@ def ensure_headers():
         if existing:
             sheet.delete_rows(1)
         sheet.insert_row(HEADERS, 1)
-
 ensure_headers()
 
 # ------------------ SIMPLE PREFS (default tipster per chat) ------------------
 PREFS_FILE = "prefs.json"
-
 def load_prefs():
     if os.path.exists(PREFS_FILE):
         try:
@@ -54,26 +58,23 @@ def load_prefs():
         except Exception:
             return {}
     return {}
-
 def save_prefs(p):
     try:
         with open(PREFS_FILE, "w") as f:
             json.dump(p, f, indent=2)
     except Exception:
-        pass  # on some hosts, disk may be ephemeral; it's okay
-
+        pass
 PREFS = load_prefs()  # { "<chat_id>": {"tipster": "Name"} }
-
 def get_default_tipster(chat_id: int) -> str:
     return PREFS.get(str(chat_id), {}).get("tipster", "Unknown")
-
 def set_default_tipster(chat_id: int, name: str):
     PREFS[str(chat_id)] = {"tipster": name}
     save_prefs(PREFS)
 
 # ------------------ HELPERS ------------------
+UK_TZ = ZoneInfo("Europe/London")
+
 def parse_odds(s: str) -> Optional[float]:
-    """Accept decimal (2.1) or fractional (11/10), return decimal > 1.0."""
     s = s.strip()
     frac = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", s)
     if frac:
@@ -88,11 +89,123 @@ def parse_odds(s: str) -> Optional[float]:
         return None
 
 def parse_money(s: str) -> Optional[float]:
-    """Accept 50, 50.00, £50, 1,250 etc., return float with 2 dp."""
     s = s.strip().replace(",", "").replace("£", "")
     try:
         return round(float(s), 2)
     except ValueError:
+        return None
+
+def parse_event_dt_local_to_string(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UK_TZ)
+    else:
+        dt = dt.astimezone(UK_TZ)
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+def parse_event_dt(s: str) -> Optional[str]:
+    if not s:
+        return None
+    raw = s.strip().lower()
+    now = datetime.now(UK_TZ)
+
+    m = re.fullmatch(r"(today|tomorrow)\s+(\d{1,2}):(\d{2})", raw)
+    if m:
+        day_word, hh, mm = m.group(1), int(m.group(2)), int(m.group(3))
+        base = now.date() if day_word == "today" else (now + timedelta(days=1)).date()
+        dt = datetime(base.year, base.month, base.day, hh, mm, tzinfo=UK_TZ)
+        return parse_event_dt_local_to_string(dt)
+
+    fmts = [
+        "%Y-%m-%d %H:%M",
+        "%d/%m/%Y %H:%M",
+        "%d %b %Y %H:%M",
+        "%d %B %Y %H:%M",
+        "%d/%m %H:%M",
+        "%d-%m-%Y %H:%M",
+    ]
+    for fmt in fmts:
+        try:
+            dt_naive = datetime.strptime(raw, fmt)
+            if fmt == "%d/%m %H:%M":
+                dt_naive = dt_naive.replace(year=now.year)
+            dt = dt_naive.replace(tzinfo=UK_TZ)
+            return parse_event_dt_local_to_string(dt)
+        except ValueError:
+            continue
+    return None
+
+# ---------- Football event date lookup (API-Football direct) ----------
+API_FOOTBALL_HOST = "v3.football.api-sports.io"
+
+def _api_get(path: str, params: dict) -> Optional[dict]:
+    if not APISPORTS_KEY:
+        return None
+    try:
+        r = requests.get(
+            f"https://{API_FOOTBALL_HOST}{path}",
+            headers={"x-apisports-key": APISPORTS_KEY},
+            params=params,
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+def guess_event_datetime_from_selection(selection: str) -> Optional[str]:
+    """
+    Best-effort:
+      - If "Team A vs Team B" or "Team A v Team B": try to find their next H2H fixture
+      - Else: find Team by name and take their next fixture
+    Returns UK-local "YYYY-MM-DD HH:MM" or None.
+    """
+    if not selection or not APISPORTS_KEY:
+        return None
+
+    # Try split "team1 vs team2"
+    m = re.split(r"\s+v(?:s|\.)?\s+", selection, flags=re.IGNORECASE)
+    team1 = team2 = None
+    if len(m) == 2:
+        team1, team2 = m[0].strip(), m[1].strip()
+
+    def find_team_id(name: str) -> Optional[int]:
+        data = _api_get("/teams", {"search": name})
+        if not data or "response" not in data or not data["response"]:
+            return None
+        return data["response"][0]["team"]["id"]
+
+    if team1 and team2:
+        id1 = find_team_id(team1)
+        id2 = find_team_id(team2)
+        if id1 and id2:
+            data = _api_get("/fixtures", {"team": id1, "next": 5})
+            if data and data.get("response"):
+                for fx in data["response"]:
+                    home = fx["teams"]["home"]["id"]
+                    away = fx["teams"]["away"]["id"]
+                    if id2 in (home, away):
+                        iso = fx["fixture"]["date"]  # ISO UTC
+                        try:
+                            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                            return parse_event_dt_local_to_string(dt.astimezone(UK_TZ))
+                        except Exception:
+                            continue
+        team_to_use = team1
+    else:
+        team_to_use = selection
+
+    team_id = find_team_id(team_to_use)
+    if not team_id:
+        return None
+    data = _api_get("/fixtures", {"team": team_id, "next": 1})
+    if not data or not data.get("response"):
+        return None
+    try:
+        iso = data["response"][0]["fixture"]["date"]
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return parse_event_dt_local_to_string(dt.astimezone(UK_TZ))
+    except Exception:
         return None
 
 def calc_return_profit(result: str, dec_odds: float, stake: float) -> Tuple[float, float]:
@@ -101,12 +214,10 @@ def calc_return_profit(result: str, dec_odds: float, stake: float) -> Tuple[floa
         return ret, round(ret - stake, 2)
     if result == "Loss":
         return 0.0, round(-stake, 2)
-    # Void
     return round(stake, 2), 0.0
 
 def find_row_by_id(bet_id: str) -> Optional[int]:
-    """Find row index (1-based) by ID in column A."""
-    ids = sheet.col_values(1)
+    ids = sheet.col_values(1)  # column A
     for idx, v in enumerate(ids, start=1):
         if v == bet_id:
             return idx
@@ -119,21 +230,22 @@ def fmt_money(v: float) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = get_default_tipster(update.effective_chat.id)
     msg = (
-        "Send bets in either format:\n"
-        "1) With tipster (5 parts):\n"
-        "`Tipster / Selection / Odds / Bookmaker / Stake`\n"
-        "e.g. `John / Liverpool / 2.1 / Bet365 / 50`\n\n"
-        "2) Without tipster (4 parts): uses your saved default tipster\n"
-        "`Selection / Odds / Bookmaker / Stake`\n"
-        "e.g. `Liverpool / 2.1 / Bet365 / 50`\n\n"
-        f"Set your default tipster with: `/tipster <name>` (current: *{current}*)"
+        "Send bets:\n"
+        "• With tipster (5): `Tipster / Selection / Odds / Bookmaker / Stake`\n"
+        "• No tipster (4): `Selection / Odds / Bookmaker / Stake`\n"
+        "• Optional event date (add as last part): `... / 05/09/2025 20:00` or `... / tomorrow 19:45`\n\n"
+        f"Set default tipster: `/tipster <name>` (current: *{current}*)\n"
+        "If you omit event date and an API key is set, I’ll try to auto-fill it for *football*."
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def tipster_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         current = get_default_tipster(update.effective_chat.id)
-        await update.message.reply_text(f"Current default tipster: {current}\nSet it with `/tipster <name>`.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"Current default tipster: {current}\nSet it with `/tipster <name>`.",
+            parse_mode="Markdown"
+        )
         return
     name = " ".join(context.args).strip()
     set_default_tipster(update.effective_chat.id, name)
@@ -144,14 +256,33 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     parts = [p.strip() for p in update.message.text.split("/")]
-    # Decide whether the user included tipster explicitly
-    if len(parts) == 5:
-        tipster, selection, odds_s, bookmaker, stake_s = parts
+    tipster = None
+    event_str = None
+
+    if len(parts) == 6:
+        tipster, selection, odds_s, bookmaker, stake_s, event_raw = parts
+        event_str = parse_event_dt(event_raw)
+        if event_raw and event_str is None:
+            await update.message.reply_text("❌ Couldn't read the event date/time. Try '2025-09-05 20:00' or 'tomorrow 19:45'.")
+            return
+    elif len(parts) == 5:
+        selection, odds_s, bookmaker, stake_s, event_raw = parts
+        tipster = get_default_tipster(update.effective_chat.id)
+        event_str = parse_event_dt(event_raw)
+        if event_raw and event_str is None:
+            await update.message.reply_text("❌ Couldn't read the event date/time. Try '2025-09-05 20:00' or 'tomorrow 19:45'.")
+            return
     elif len(parts) == 4:
         tipster = get_default_tipster(update.effective_chat.id)
         selection, odds_s, bookmaker, stake_s = parts
     else:
-        await update.message.reply_text("❌ Use one of:\n• Tipster / Selection / Odds / Bookmaker / Stake\n• Selection / Odds / Bookmaker / Stake")
+        await update.message.reply_text(
+            "❌ Use one of:\n"
+            "• Tipster / Selection / Odds / Bookmaker / Stake\n"
+            "• Selection / Odds / Bookmaker / Stake\n"
+            "• Tipster / Selection / Odds / Bookmaker / Stake / EventDateTime\n"
+            "• Selection / Odds / Bookmaker / Stake / EventDateTime"
+        )
         return
 
     dec_odds = parse_odds(odds_s)
@@ -160,12 +291,20 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Check odds/stake. Examples: odds 2.1 or 11/10, stake 25 or £25")
         return
 
-    bet_id = uuid.uuid4().hex[:8].upper()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if not tipster or tipster.strip() == "":
+        tipster = "Unknown"
 
-    # Append 10 values (A..J). Column K (Cumulative Profit) is computed by the Sheet formula.
+    # If event date is missing, try auto-detect (football) using the selection text
+    if not event_str:
+        guessed = guess_event_datetime_from_selection(selection)
+        event_str = guessed or ""
+
+    bet_id = uuid.uuid4().hex[:8].upper()
+    now = datetime.now(UK_TZ).strftime("%Y-%m-%d %H:%M")
+
+    # Append: A..L (12 fields)
     try:
-        sheet.append_row([bet_id, now, tipster, selection, dec_odds, bookmaker, stake, "Pending", "", ""])
+        sheet.append_row([bet_id, now, event_str, tipster, selection, dec_odds, bookmaker, stake, "Pending", "", "", ""])
     except Exception as e:
         await update.message.reply_text(f"⚠️ Could not write to Google Sheet: {e}")
         return
@@ -175,9 +314,10 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("⚪ Void", callback_data=f"res|{bet_id}|Void"),
         InlineKeyboardButton("❌ Loss", callback_data=f"res|{bet_id}|Loss"),
     ]]
+    shown_event = f"\nEvent: {event_str}" if event_str else ""
     text = (
-        f"✅ Bet logged (ID: {bet_id})\n"
-        f"[{tipster}] {selection} @ {dec_odds:.2f} ({bookmaker}) {fmt_money(stake)}\n"
+        f"✅ Bet logged (ID: {bet_id}){shown_event}\n"
+        f"[{tipster}] {selection} @ {dec_odds:.2f} ({bookmaker}) £{stake:,.2f}\n"
         f"Status: Pending"
     )
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -192,23 +332,28 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ Could not find this bet in the sheet.")
             return
 
-        # Read unformatted numbers to avoid currency parsing issues
         values = sheet.row_values(row, value_render_option='UNFORMATTED_VALUE')
-        # Indexes: 0 ID, 1 Date, 2 Tipster, 3 Selection, 4 Odds, 5 Bookmaker, 6 Stake, 7 Status, 8 Return, 9 Profit, 10 CumProfit
-        dec_odds = float(values[4])
-        stake = float(values[6])
+        # Indexes: 0 ID,1 DatePlaced,2 EventDate,3 Tipster,4 Selection,5 Odds,6 Bookmaker,7 Stake,8 Status,9 Return,10 Profit,11 CumProfit
+        dec_odds = float(values[5])
+        stake = float(values[7])
 
-        ret, prof = calc_return_profit(result, dec_odds, stake)
+        def calc_return_profit_local(res: str, d: float, st: float) -> Tuple[float, float]:
+            if res == "Win":
+                ret = round(d * st, 2);  return ret, round(ret - st, 2)
+            if res == "Loss":
+                return 0.0, round(-st, 2)
+            return round(st, 2), 0.0
 
-        # Update Status (H col=8), Return (I col=9), Profit (J col=10)
-        sheet.update_cell(row, 8, result)
-        sheet.update_cell(row, 9, f"{ret:.2f}")
-        sheet.update_cell(row, 10, f"{prof:.2f}")
+        ret, prof = calc_return_profit_local(result, dec_odds, stake)
+
+        sheet.update_cell(row, 9, result)          # I
+        sheet.update_cell(row, 10, f"{ret:.2f}")   # J
+        sheet.update_cell(row, 11, f"{prof:.2f}")  # K
 
         new_text = (
             f"📝 Bet (ID: {bet_id})\n"
-            f"[{values[2]}] {values[3]} @ {dec_odds:.2f} ({values[5]}) {fmt_money(stake)}\n"
-            f"Result: {result} • Return: {fmt_money(ret)} • Profit: {fmt_money(prof)}"
+            f"[{values[3]}] {values[4]} @ {dec_odds:.2f} ({values[6]}) £{stake:,.2f}\n"
+            f"Result: {result} • Return: £{ret:,.2f} • Profit: £{prof:,.2f}"
         )
         await query.edit_message_text(new_text)
     except Exception as e:
