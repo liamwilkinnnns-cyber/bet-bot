@@ -38,7 +38,7 @@ ss = client.open(SHEET_NAME)
 sheet = ss.worksheet("Bets")  # change if your tab has a different name
 
 def ensure_headers():
-    # Make sure the header row exists and is correct (don’t delete row 1 to avoid filter/pivot issues)
+    # Do not delete row 1 (filters/pivots) — just overwrite.
     try:
         _ = sheet.row_values(1)
     except Exception:
@@ -154,42 +154,43 @@ def parse_event_dt(s: str) -> Optional[str]:
         dt = datetime(base.year, base.month, base.day, hh, mm, tzinfo=UK_TZ)
         return to_uk_string(dt)
 
-    # DATE first
-    date_first = [
-        "%Y-%m-%d %H:%M",
-        "%d/%m/%Y %H:%M",
-        "%d-%m-%Y %H:%M",
-        "%d %b %Y %H:%M",
-        "%d %B %Y %H:%M",
-        "%d/%m %H:%M",  # assume current year
-    ]
-    for fmt in date_first:
+    # explicit with year (DATE first)
+    for fmt in ("%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M", "%d %b %Y %H:%M", "%d %B %Y %H:%M"):
         try:
             dt_naive = datetime.strptime(raw, fmt)
-            if fmt == "%d/%m %H:%M":
-                dt_naive = dt_naive.replace(year=now.year)
             dt = dt_naive.replace(tzinfo=UK_TZ)
             return to_uk_string(dt)
         except ValueError:
             pass
 
-    # TIME first
-    time_first = [
-        "%H:%M %d/%m/%Y",
-        "%H:%M %d-%m-%Y",
-        "%H:%M %d %b %Y",
-        "%H:%M %d %B %Y",
-        "%H:%M %d/%m",  # assume current year
-    ]
-    for fmt in time_first:
+    # explicit with year (TIME first)
+    for fmt in ("%H:%M %d/%m/%Y", "%H:%M %d-%m-%Y", "%H:%M %d %b %Y", "%H:%M %d %B %Y"):
         try:
             dt_naive = datetime.strptime(raw, fmt)
-            if fmt == "%H:%M %d/%m":
-                dt_naive = dt_naive.replace(year=now.year)
             dt = dt_naive.replace(tzinfo=UK_TZ)
             return to_uk_string(dt)
         except ValueError:
             pass
+
+    # no-year DATE first: 05/09 20:00  → assume current year
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})", raw)
+    if m:
+        d, mth, hh, mm = map(int, m.groups())
+        try:
+            dt = datetime(now.year, mth, d, hh, mm, tzinfo=UK_TZ)
+            return to_uk_string(dt)
+        except ValueError:
+            return None
+
+    # no-year TIME first: 20:00 05/09  → assume current year
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})\s+(\d{1,2})/(\d{1,2})", raw)
+    if m:
+        hh, mm, d, mth = map(int, m.groups())
+        try:
+            dt = datetime(now.year, mth, d, hh, mm, tzinfo=UK_TZ)
+            return to_uk_string(dt)
+        except ValueError:
+            return None
 
     return None
 
@@ -235,6 +236,15 @@ async def tipster_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_default_tipster(update.effective_chat.id, name)
     await update.message.reply_text(f"✅ Default tipster set to: {name}")
 
+def _looks_like_date(s: str) -> bool:
+    return parse_event_dt(s) is not None
+
+def _looks_like_odds(s: str) -> bool:
+    return parse_odds(s) is not None
+
+def _looks_like_money(s: str) -> bool:
+    return parse_money(s) is not None
+
 async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -244,24 +254,45 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     event_str = None
 
     if len(parts) == 6:
-        # Tipster provided + Event Date provided
+        # Tipster + Event Date provided
         tipster, selection, odds_s, bookmaker, stake_s, event_raw = parts
         event_str = parse_event_dt(event_raw)
         if event_raw and event_str is None:
             await update.message.reply_text("❌ Couldn't read the event date/time. Try '2025-09-05 20:00', '20:00 05/09/2025', or 'tomorrow 19:45'.")
             return
+
     elif len(parts) == 5:
-        # No tipster provided, but Event Date provided
-        selection, odds_s, bookmaker, stake_s, event_raw = parts
-        tipster = get_default_tipster(update.effective_chat.id)
-        event_str = parse_event_dt(event_raw)
-        if event_raw and event_str is None:
-            await update.message.reply_text("❌ Couldn't read the event date/time. Try '2025-09-05 20:00', '20:00 05/09/2025', or 'tomorrow 19:45'.")
+        # Ambiguous: could be (A) tipster/no-date OR (B) no-tipster/with-date.
+        A_tipster, A_selection, A_odds, A_book, A_stake = parts
+        B_selection, B_odds, B_book, B_stake, B_event = parts
+
+        a_ok = _looks_like_odds(A_odds) and _looks_like_money(A_stake)
+        b_ok = _looks_like_odds(B_odds) and _looks_like_money(B_stake) and _looks_like_date(B_event)
+
+        if a_ok and not b_ok:
+            # Pattern A: Tipster present, no event date
+            tipster, selection, odds_s, bookmaker, stake_s = parts
+        elif b_ok and not a_ok:
+            # Pattern B: No tipster, event date present
+            selection, odds_s, bookmaker, stake_s, event_raw = parts
+            tipster = get_default_tipster(update.effective_chat.id)
+            event_str = parse_event_dt(event_raw)
+        elif a_ok and b_ok:
+            # Both "could" work — prefer A (you explicitly gave a tipster)
+            tipster, selection, odds_s, bookmaker, stake_s = parts
+        else:
+            await update.message.reply_text(
+                "❌ I couldn't understand that. Use one of:\n"
+                "• Tipster / Selection / Odds / Bookmaker / Stake\n"
+                "• Selection / Odds / Bookmaker / Stake / EventDateTime"
+            )
             return
+
     elif len(parts) == 4:
-        # No event date provided
+        # No event date, use default tipster
         tipster = get_default_tipster(update.effective_chat.id)
         selection, odds_s, bookmaker, stake_s = parts
+
     else:
         await update.message.reply_text(
             "❌ Format error. Use one of:\n"
@@ -319,7 +350,15 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dec_odds = float(values[5])
         stake = float(values[7])
 
+        def calc_return_profit(result: str, dec_odds: float, stake: float) -> Tuple[float, float]:
+            if result == "Win":
+                ret = round(dec_odds * stake, 2);  return ret, round(ret - stake, 2)
+            if result == "Loss":
+                return 0.0, round(-stake, 2)
+            return round(stake, 2), 0.0
+
         ret, prof = calc_return_profit(result, dec_odds, stake)
+
         sheet.update_cell(row, 9, result)          # I: Status
         sheet.update_cell(row, 10, f"{ret:.2f}")   # J: Return
         sheet.update_cell(row, 11, f"{prof:.2f}")  # K: Profit
@@ -327,7 +366,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_text = (
             f"📝 Bet (ID: {bet_id})\n"
             f"[{values[3]}] {values[4]} @ {dec_odds:.2f} ({values[6]}) £{stake:,.2f}\n"
-            f"Result: {result} • Return: {fmt_money(ret)} • Profit: {fmt_money(prof)}"
+            f"Result: {result} • Return: £{ret:,.2f} • Profit: £{prof:,.2f}"
         )
         await query.edit_message_text(new_text)
     except Exception as e:
