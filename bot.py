@@ -3,6 +3,7 @@ import re
 import json
 import uuid
 import requests
+import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, Tuple
@@ -17,12 +18,10 @@ from gspread.utils import rowcol_to_a1
 # ------------------ ENV ------------------
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
-# API-Football (direct) key for auto event date (football only)
-APISPORTS_KEY = os.getenv("APISPORTS_KEY")  # add in Render Environment
+APISPORTS_KEY = os.getenv("APISPORTS_KEY")  # API-Football (direct) key
 
 # ------------------ SHEETS SETUP ------------------
-SHEET_NAME = "Bet Tracker"  # Google spreadsheet name
+SHEET_NAME = "Bet Tracker"
 HEADERS = [
     "ID", "Date Placed", "Event Date", "Tipster", "Selection",
     "Odds (dec)", "Bookmaker", "Stake", "Status", "Return",
@@ -30,7 +29,6 @@ HEADERS = [
 ]
 SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-# Prefer GOOGLE_CREDS_JSON on hosts like Render. Fallback to local file on your Mac.
 if os.getenv("GOOGLE_CREDS_JSON"):
     creds_dict = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
     CREDS = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
@@ -43,22 +41,17 @@ sheet = ss.worksheet("Bets")  # change if your tab has a different name
 
 def ensure_headers():
     try:
-        existing = sheet.row_values(1)
+        _ = sheet.row_values(1)
     except Exception:
-        existing = []
-
-    # Ensure at least len(HEADERS) columns exist
+        _ = []
     if sheet.col_count < len(HEADERS):
         sheet.add_cols(len(HEADERS) - sheet.col_count)
-
-    # Overwrite header row (avoid deleting filters/pivots)
-    end_a1 = rowcol_to_a1(1, len(HEADERS))  # e.g. A1:L1
-    header_range = f"A1:{end_a1}"
-    sheet.update(values=[HEADERS], range_name=header_range)
+    end_a1 = rowcol_to_a1(1, len(HEADERS))
+    sheet.update(values=[HEADERS], range_name=f"A1:{end_a1}")
 
 ensure_headers()
 
-# ------------------ SIMPLE PREFS (default tipster per chat) ------------------
+# ------------------ SIMPLE PREFS ------------------
 PREFS_FILE = "prefs.json"
 def load_prefs():
     if os.path.exists(PREFS_FILE):
@@ -68,12 +61,13 @@ def load_prefs():
         except Exception:
             return {}
     return {}
-def save_prefs(p):
+def save_prefs(p):  # disk may be ephemeral on hosts; best effort is fine
     try:
         with open(PREFS_FILE, "w") as f:
             json.dump(p, f, indent=2)
     except Exception:
         pass
+
 PREFS = load_prefs()
 def get_default_tipster(chat_id: int) -> str:
     return PREFS.get(str(chat_id), {}).get("tipster", "Unknown")
@@ -86,11 +80,8 @@ UK_TZ = ZoneInfo("Europe/London")
 
 def parse_odds(s: str) -> Optional[float]:
     """
-    Accepts:
-      - Decimal with commas or dots (2.5, 2,50)
-      - Fractional (11/10, 5/2)
-      - Ignores stray & non-breaking spaces
-    Returns decimal odds > 1.0 or None.
+    Accepts decimal (2.5, 2,50) or fractional (11/10).
+    Ignores stray/non-breaking spaces; returns decimal > 1.0.
     """
     if not s:
         return None
@@ -102,7 +93,7 @@ def parse_odds(s: str) -> Optional[float]:
         if den == 0:
             return None
         return 1.0 + (num / den)
-    # decimal: keep only digits, comma, dot; convert comma to dot
+    # decimal: keep digits/comma/dot → normalize to dot
     cleaned = re.sub(r"[^0-9,.\s]", "", s).replace(",", ".").strip()
     try:
         v = float(cleaned)
@@ -112,14 +103,12 @@ def parse_odds(s: str) -> Optional[float]:
 
 def parse_money(s: str) -> Optional[float]:
     """
-    Accepts 50, 50.00, £50, 1,250, £1.250 etc.
-    Ignores commas, currency symbols, weird spaces.
+    Accepts 50, £50, 1,250, 50.00, etc. Ignores symbols/spaces.
     """
     if not s:
         return None
     s = s.strip().replace("\u00A0", " ").replace("\u202F", " ")
     cleaned = re.sub(r"[^0-9.]", "", s)
-    # collapse all but the last dot (e.g., "1.234.56" -> "1234.56")
     parts = cleaned.split(".")
     if len(parts) > 2:
         cleaned = "".join(parts[:-1]) + "." + parts[-1]
@@ -129,7 +118,7 @@ def parse_money(s: str) -> Optional[float]:
     except ValueError:
         return None
 
-def parse_event_dt_local_to_string(dt: datetime) -> str:
+def to_uk_string(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UK_TZ)
     else:
@@ -137,25 +126,28 @@ def parse_event_dt_local_to_string(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 def parse_event_dt(s: str) -> Optional[str]:
+    """Accepts many UK-friendly formats; returns 'YYYY-MM-DD HH:MM' UK time."""
     if not s:
         return None
     raw = s.strip().lower()
     now = datetime.now(UK_TZ)
 
+    # today/tomorrow HH:MM
     m = re.fullmatch(r"(today|tomorrow)\s+(\d{1,2}):(\d{2})", raw)
     if m:
         day_word, hh, mm = m.group(1), int(m.group(2)), int(m.group(3))
         base = now.date() if day_word == "today" else (now + timedelta(days=1)).date()
         dt = datetime(base.year, base.month, base.day, hh, mm, tzinfo=UK_TZ)
-        return parse_event_dt_local_to_string(dt)
+        return to_uk_string(dt)
 
+    # Try common explicit patterns (DATE FIRST)
     fmts = [
         "%Y-%m-%d %H:%M",
         "%d/%m/%Y %H:%M",
+        "%d-%m-%Y %H:%M",
         "%d %b %Y %H:%M",
         "%d %B %Y %H:%M",
-        "%d/%m %H:%M",
-        "%d-%m-%Y %H:%M",
+        "%d/%m %H:%M",      # assume current year
     ]
     for fmt in fmts:
         try:
@@ -163,9 +155,28 @@ def parse_event_dt(s: str) -> Optional[str]:
             if fmt == "%d/%m %H:%M":
                 dt_naive = dt_naive.replace(year=now.year)
             dt = dt_naive.replace(tzinfo=UK_TZ)
-            return parse_event_dt_local_to_string(dt)
+            return to_uk_string(dt)
         except ValueError:
-            continue
+            pass
+
+    # Try TIME FIRST (e.g., '20:00 05/09/2025' or '20:00 05/09')
+    fmts_time_first = [
+        "%H:%M %d/%m/%Y",
+        "%H:%M %d-%m-%Y",
+        "%H:%M %d %b %Y",
+        "%H:%M %d %B %Y",
+        "%H:%M %d/%m",      # assume current year
+    ]
+    for fmt in fmts_time_first:
+        try:
+            dt_naive = datetime.strptime(raw, fmt)
+            if fmt == "%H:%M %d/%m":
+                dt_naive = dt_naive.replace(year=now.year)
+            dt = dt_naive.replace(tzinfo=UK_TZ)
+            return to_uk_string(dt)
+        except ValueError:
+            pass
+
     return None
 
 # ---------- Football event date lookup (API-Football direct) ----------
@@ -189,15 +200,14 @@ def _api_get(path: str, params: dict) -> Optional[dict]:
 
 def guess_event_datetime_from_selection(selection: str) -> Optional[str]:
     """
-    Best-effort:
-      - If "Team A vs Team B" or "Team A v Team B": try to find their next H2H fixture
-      - Else: find Team by name and take their next fixture
-    Returns UK-local "YYYY-MM-DD HH:MM" or None.
+    If 'Team A v Team B' → try to find their next head-to-head.
+    Else → find Team and take next fixture.
+    Return 'YYYY-MM-DD HH:MM' UK or None.
     """
     if not selection or not APISPORTS_KEY:
         return None
 
-    # Try split "team1 vs team2"
+    # Split "team1 vs team2"
     m = re.split(r"\s+v(?:s|\.)?\s+", selection, flags=re.IGNORECASE)
     team1 = team2 = None
     if len(m) == 2:
@@ -222,7 +232,7 @@ def guess_event_datetime_from_selection(selection: str) -> Optional[str]:
                         iso = fx["fixture"]["date"]
                         try:
                             dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-                            return parse_event_dt_local_to_string(dt.astimezone(UK_TZ))
+                            return to_uk_string(dt.astimezone(UK_TZ))
                         except Exception:
                             continue
         team_to_use = team1
@@ -238,14 +248,13 @@ def guess_event_datetime_from_selection(selection: str) -> Optional[str]:
     try:
         iso = data["response"][0]["fixture"]["date"]
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return parse_event_dt_local_to_string(dt.astimezone(UK_TZ))
+        return to_uk_string(dt.astimezone(UK_TZ))
     except Exception:
         return None
 
 def calc_return_profit(result: str, dec_odds: float, stake: float) -> Tuple[float, float]:
     if result == "Win":
-        ret = round(dec_odds * stake, 2)
-        return ret, round(ret - stake, 2)
+        ret = round(dec_odds * stake, 2); return ret, round(ret - stake, 2)
     if result == "Loss":
         return 0.0, round(-stake, 2)
     return round(stake, 2), 0.0
@@ -267,7 +276,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Send bets:\n"
         "• With tipster (5): `Tipster / Selection / Odds / Bookmaker / Stake`\n"
         "• No tipster (4): `Selection / Odds / Bookmaker / Stake`\n"
-        "• Optional event date (add last): `... / 05/09/2025 20:00` or `... / tomorrow 19:45`\n\n"
+        "• Optional event date last: `... / 05/09/2025 20:00` or `... / 20:00 05/09/2025` or `... / tomorrow 19:45`\n\n"
         f"Set default tipster: `/tipster <name>` (current: *{current}*)\n"
         "If you omit event date and an API key is set, I’ll try to auto-fill it for *football*."
     )
@@ -297,14 +306,14 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tipster, selection, odds_s, bookmaker, stake_s, event_raw = parts
         event_str = parse_event_dt(event_raw)
         if event_raw and event_str is None:
-            await update.message.reply_text("❌ Couldn't read the event date/time. Try '2025-09-05 20:00' or 'tomorrow 19:45'.")
+            await update.message.reply_text("❌ Couldn't read the event date/time. Try '2025-09-05 20:00', '20:00 05/09/2025', or 'tomorrow 19:45'.")
             return
     elif len(parts) == 5:
         selection, odds_s, bookmaker, stake_s, event_raw = parts
         tipster = get_default_tipster(update.effective_chat.id)
         event_str = parse_event_dt(event_raw)
         if event_raw and event_str is None:
-            await update.message.reply_text("❌ Couldn't read the event date/time. Try '2025-09-05 20:00' or 'tomorrow 19:45'.")
+            await update.message.reply_text("❌ Couldn't read the event date/time. Try '2025-09-05 20:00', '20:00 05/09/2025', or 'tomorrow 19:45'.")
             return
     elif len(parts) == 4:
         tipster = get_default_tipster(update.effective_chat.id)
@@ -328,7 +337,6 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tipster or tipster.strip() == "":
         tipster = "Unknown"
 
-    # If event date is missing, try auto-detect (football) using the selection text
     if not event_str:
         guessed = guess_event_datetime_from_selection(selection)
         event_str = guessed or ""
@@ -336,7 +344,6 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bet_id = uuid.uuid4().hex[:8].upper()
     now = datetime.now(UK_TZ).strftime("%Y-%m-%d %H:%M")
 
-    # Append row: A..L (12 values)
     try:
         sheet.append_row([bet_id, now, event_str, tipster, selection, dec_odds, bookmaker, stake, "Pending", "", "", ""])
     except Exception as e:
@@ -367,7 +374,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         values = sheet.row_values(row, value_render_option='UNFORMATTED_VALUE')
-        # Indexes: 0 ID,1 DatePlaced,2 EventDate,3 Tipster,4 Selection,5 Odds,6 Bookmaker,7 Stake,8 Status,9 Return,10 Profit,11 CumProfit
         dec_odds = float(values[5])
         stake = float(values[7])
 
@@ -386,10 +392,17 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"⚠️ Error: {e}")
 
 # ------------------ MAIN ------------------
+async def _post_init(app: Application):
+    # Kill any leftover webhook so polling never conflicts
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
 def main():
     if not TOKEN:
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN in your .env or Render env vars.")
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("tipster", tipster_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_bet))
