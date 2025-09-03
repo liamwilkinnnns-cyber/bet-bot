@@ -19,7 +19,7 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # API-Football (direct) key for auto event date (football only)
-APISPORTS_KEY = os.getenv("APISPORTS_KEY")
+APISPORTS_KEY = os.getenv("APISPORTS_KEY")  # add in Render Environment
 
 # ------------------ SHEETS SETUP ------------------
 SHEET_NAME = "Bet Tracker"  # Google spreadsheet name
@@ -47,12 +47,14 @@ def ensure_headers():
     except Exception:
         existing = []
 
+    # Ensure at least len(HEADERS) columns exist
     if sheet.col_count < len(HEADERS):
         sheet.add_cols(len(HEADERS) - sheet.col_count)
 
-    end_a1 = rowcol_to_a1(1, len(HEADERS))
+    # Overwrite header row (avoid deleting filters/pivots)
+    end_a1 = rowcol_to_a1(1, len(HEADERS))  # e.g. A1:L1
     header_range = f"A1:{end_a1}"
-    sheet.update(header_range, [HEADERS])
+    sheet.update(values=[HEADERS], range_name=header_range)
 
 ensure_headers()
 
@@ -83,23 +85,47 @@ def set_default_tipster(chat_id: int, name: str):
 UK_TZ = ZoneInfo("Europe/London")
 
 def parse_odds(s: str) -> Optional[float]:
-    s = s.strip()
+    """
+    Accepts:
+      - Decimal with commas or dots (2.5, 2,50)
+      - Fractional (11/10, 5/2)
+      - Ignores stray & non-breaking spaces
+    Returns decimal odds > 1.0 or None.
+    """
+    if not s:
+        return None
+    s = s.strip().replace("\u00A0", " ").replace("\u202F", " ")
+    # fractional?
     frac = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", s)
     if frac:
         num, den = int(frac.group(1)), int(frac.group(2))
         if den == 0:
             return None
         return 1.0 + (num / den)
+    # decimal: keep only digits, comma, dot; convert comma to dot
+    cleaned = re.sub(r"[^0-9,.\s]", "", s).replace(",", ".").strip()
     try:
-        v = float(s)
+        v = float(cleaned)
         return v if v > 1.0 else None
     except ValueError:
         return None
 
 def parse_money(s: str) -> Optional[float]:
-    s = s.strip().replace(",", "").replace("£", "")
+    """
+    Accepts 50, 50.00, £50, 1,250, £1.250 etc.
+    Ignores commas, currency symbols, weird spaces.
+    """
+    if not s:
+        return None
+    s = s.strip().replace("\u00A0", " ").replace("\u202F", " ")
+    cleaned = re.sub(r"[^0-9.]", "", s)
+    # collapse all but the last dot (e.g., "1.234.56" -> "1234.56")
+    parts = cleaned.split(".")
+    if len(parts) > 2:
+        cleaned = "".join(parts[:-1]) + "." + parts[-1]
     try:
-        return round(float(s), 2)
+        v = float(cleaned)
+        return round(v, 2) if v > 0 else None
     except ValueError:
         return None
 
@@ -162,9 +188,16 @@ def _api_get(path: str, params: dict) -> Optional[dict]:
         return None
 
 def guess_event_datetime_from_selection(selection: str) -> Optional[str]:
+    """
+    Best-effort:
+      - If "Team A vs Team B" or "Team A v Team B": try to find their next H2H fixture
+      - Else: find Team by name and take their next fixture
+    Returns UK-local "YYYY-MM-DD HH:MM" or None.
+    """
     if not selection or not APISPORTS_KEY:
         return None
 
+    # Try split "team1 vs team2"
     m = re.split(r"\s+v(?:s|\.)?\s+", selection, flags=re.IGNORECASE)
     team1 = team2 = None
     if len(m) == 2:
@@ -263,26 +296,39 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) == 6:
         tipster, selection, odds_s, bookmaker, stake_s, event_raw = parts
         event_str = parse_event_dt(event_raw)
+        if event_raw and event_str is None:
+            await update.message.reply_text("❌ Couldn't read the event date/time. Try '2025-09-05 20:00' or 'tomorrow 19:45'.")
+            return
     elif len(parts) == 5:
         selection, odds_s, bookmaker, stake_s, event_raw = parts
         tipster = get_default_tipster(update.effective_chat.id)
         event_str = parse_event_dt(event_raw)
+        if event_raw and event_str is None:
+            await update.message.reply_text("❌ Couldn't read the event date/time. Try '2025-09-05 20:00' or 'tomorrow 19:45'.")
+            return
     elif len(parts) == 4:
         tipster = get_default_tipster(update.effective_chat.id)
         selection, odds_s, bookmaker, stake_s = parts
     else:
-        await update.message.reply_text("❌ Format error. Use /start for instructions.")
+        await update.message.reply_text(
+            "❌ Format error. Use one of:\n"
+            "• Tipster / Selection / Odds / Bookmaker / Stake\n"
+            "• Selection / Odds / Bookmaker / Stake\n"
+            "• Tipster / Selection / Odds / Bookmaker / Stake / EventDateTime\n"
+            "• Selection / Odds / Bookmaker / Stake / EventDateTime"
+        )
         return
 
     dec_odds = parse_odds(odds_s)
     stake = parse_money(stake_s)
     if dec_odds is None or stake is None or stake <= 0:
-        await update.message.reply_text("❌ Check odds/stake.")
+        await update.message.reply_text("❌ Check odds/stake. Examples: 2.1 or 11/10, stake 25 or £25")
         return
 
     if not tipster or tipster.strip() == "":
         tipster = "Unknown"
 
+    # If event date is missing, try auto-detect (football) using the selection text
     if not event_str:
         guessed = guess_event_datetime_from_selection(selection)
         event_str = guessed or ""
@@ -290,6 +336,7 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bet_id = uuid.uuid4().hex[:8].upper()
     now = datetime.now(UK_TZ).strftime("%Y-%m-%d %H:%M")
 
+    # Append row: A..L (12 values)
     try:
         sheet.append_row([bet_id, now, event_str, tipster, selection, dec_odds, bookmaker, stake, "Pending", "", "", ""])
     except Exception as e:
@@ -304,7 +351,7 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     shown_event = f"\nEvent: {event_str}" if event_str else ""
     text = (
         f"✅ Bet logged (ID: {bet_id}){shown_event}\n"
-        f"[{tipster}] {selection} @ {dec_odds:.2f} ({bookmaker}) £{stake:,.2f}\n"
+        f"[{tipster}] {selection} @ {dec_odds:.2f} ({bookmaker}) {fmt_money(stake)}\n"
         f"Status: Pending"
     )
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -320,18 +367,19 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         values = sheet.row_values(row, value_render_option='UNFORMATTED_VALUE')
+        # Indexes: 0 ID,1 DatePlaced,2 EventDate,3 Tipster,4 Selection,5 Odds,6 Bookmaker,7 Stake,8 Status,9 Return,10 Profit,11 CumProfit
         dec_odds = float(values[5])
         stake = float(values[7])
 
         ret, prof = calc_return_profit(result, dec_odds, stake)
-        sheet.update_cell(row, 9, result)
-        sheet.update_cell(row, 10, f"{ret:.2f}")
-        sheet.update_cell(row, 11, f"{prof:.2f}")
+        sheet.update_cell(row, 9, result)          # I: Status
+        sheet.update_cell(row, 10, f"{ret:.2f}")   # J: Return
+        sheet.update_cell(row, 11, f"{prof:.2f}")  # K: Profit
 
         new_text = (
             f"📝 Bet (ID: {bet_id})\n"
-            f"[{values[3]}] {values[4]} @ {dec_odds:.2f} ({values[6]}) £{stake:,.2f}\n"
-            f"Result: {result} • Return: £{ret:,.2f} • Profit: £{prof:,.2f}"
+            f"[{values[3]}] {values[4]} @ {dec_odds:.2f} ({values[6]}) {fmt_money(stake)}\n"
+            f"Result: {result} • Return: {fmt_money(ret)} • Profit: {fmt_money(prof)}"
         )
         await query.edit_message_text(new_text)
     except Exception as e:
