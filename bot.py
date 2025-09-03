@@ -1,6 +1,6 @@
-import json
 import os
 import re
+import json
 import uuid
 from datetime import datetime
 from typing import Optional, Tuple
@@ -16,28 +16,23 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # ------------------ SHEETS SETUP ------------------
-SHEET_NAME = "Bet Tracker"  # the spreadsheet file name
+SHEET_NAME = "Bet Tracker"  # Google spreadsheet file name
 HEADERS = [
-    "ID", "Date Placed", "Selection", "Odds (dec)",
-    "Bookmaker", "Stake", "Status", "Return", "Profit",
-    "Cumulative Profit"
+    "ID", "Date Placed", "Tipster", "Selection", "Odds (dec)",
+    "Bookmaker", "Stake", "Status", "Return", "Profit", "Cumulative Profit"
 ]
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-
+# Prefer GOOGLE_CREDS_JSON (Render). Fallback to local credentials.json on your Mac.
 if os.getenv("GOOGLE_CREDS_JSON"):
-    # Read the whole JSON from the env var on Render
     creds_dict = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    CREDS = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
 else:
-    # Fallback for running on your Mac
-    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    CREDS = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", SCOPE)
 
-client = gspread.authorize(creds)
-
-# Open the spreadsheet by name, then the tab named "Bets"
+client = gspread.authorize(CREDS)
 ss = client.open(SHEET_NAME)
-sheet = ss.worksheet("Bets")  # change to ss.get_worksheet(0) if you prefer "first tab" logic
+sheet = ss.worksheet("Bets")  # change if your tab has a different name
 
 def ensure_headers():
     existing = sheet.row_values(1)
@@ -48,18 +43,44 @@ def ensure_headers():
 
 ensure_headers()
 
+# ------------------ SIMPLE PREFS (default tipster per chat) ------------------
+PREFS_FILE = "prefs.json"
+
+def load_prefs():
+    if os.path.exists(PREFS_FILE):
+        try:
+            with open(PREFS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_prefs(p):
+    try:
+        with open(PREFS_FILE, "w") as f:
+            json.dump(p, f, indent=2)
+    except Exception:
+        pass  # on some hosts, disk may be ephemeral; it's okay
+
+PREFS = load_prefs()  # { "<chat_id>": {"tipster": "Name"} }
+
+def get_default_tipster(chat_id: int) -> str:
+    return PREFS.get(str(chat_id), {}).get("tipster", "Unknown")
+
+def set_default_tipster(chat_id: int, name: str):
+    PREFS[str(chat_id)] = {"tipster": name}
+    save_prefs(PREFS)
+
 # ------------------ HELPERS ------------------
 def parse_odds(s: str) -> Optional[float]:
-    """Accept decimal odds (e.g. 2.1) or fractional (e.g. 11/10), return decimal."""
+    """Accept decimal (2.1) or fractional (11/10), return decimal > 1.0."""
     s = s.strip()
-    # fractional like 11/10
     frac = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", s)
     if frac:
         num, den = int(frac.group(1)), int(frac.group(2))
         if den == 0:
             return None
         return 1.0 + (num / den)
-    # decimal like 2.10
     try:
         v = float(s)
         return v if v > 1.0 else None
@@ -67,7 +88,7 @@ def parse_odds(s: str) -> Optional[float]:
         return None
 
 def parse_money(s: str) -> Optional[float]:
-    """Accept 50, 50.00, £50, 1,250 etc."""
+    """Accept 50, 50.00, £50, 1,250 etc., return float with 2 dp."""
     s = s.strip().replace(",", "").replace("£", "")
     try:
         return round(float(s), 2)
@@ -75,7 +96,6 @@ def parse_money(s: str) -> Optional[float]:
         return None
 
 def calc_return_profit(result: str, dec_odds: float, stake: float) -> Tuple[float, float]:
-    """Return (return_amount, profit) based on result."""
     if result == "Win":
         ret = round(dec_odds * stake, 2)
         return ret, round(ret - stake, 2)
@@ -97,29 +117,45 @@ def fmt_money(v: float) -> str:
 
 # ------------------ BOT HANDLERS ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current = get_default_tipster(update.effective_chat.id)
     msg = (
-        "Send bets as:\n"
-        "`Selection / Odds / Bookmaker / Stake`\n\n"
-        "Examples:\n"
-        "`Liverpool / 2.1 / Bet365 / 50`\n"
-        "`Chelsea / 11/10 / SkyBet / 25`\n\n"
-        "I'll save it to your *Bets* sheet and show buttons to settle it."
+        "Send bets in either format:\n"
+        "1) With tipster (5 parts):\n"
+        "`Tipster / Selection / Odds / Bookmaker / Stake`\n"
+        "e.g. `John / Liverpool / 2.1 / Bet365 / 50`\n\n"
+        "2) Without tipster (4 parts): uses your saved default tipster\n"
+        "`Selection / Odds / Bookmaker / Stake`\n"
+        "e.g. `Liverpool / 2.1 / Bet365 / 50`\n\n"
+        f"Set your default tipster with: `/tipster <name>` (current: *{current}*)"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def tipster_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        current = get_default_tipster(update.effective_chat.id)
+        await update.message.reply_text(f"Current default tipster: {current}\nSet it with `/tipster <name>`.", parse_mode="Markdown")
+        return
+    name = " ".join(context.args).strip()
+    set_default_tipster(update.effective_chat.id, name)
+    await update.message.reply_text(f"✅ Default tipster set to: {name}")
 
 async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
     parts = [p.strip() for p in update.message.text.split("/")]
-    if len(parts) != 4:
-        await update.message.reply_text("❌ Use: Selection / Odds / Bookmaker / Stake")
+    # Decide whether the user included tipster explicitly
+    if len(parts) == 5:
+        tipster, selection, odds_s, bookmaker, stake_s = parts
+    elif len(parts) == 4:
+        tipster = get_default_tipster(update.effective_chat.id)
+        selection, odds_s, bookmaker, stake_s = parts
+    else:
+        await update.message.reply_text("❌ Use one of:\n• Tipster / Selection / Odds / Bookmaker / Stake\n• Selection / Odds / Bookmaker / Stake")
         return
 
-    selection, odds_s, bookmaker, stake_s = parts
     dec_odds = parse_odds(odds_s)
     stake = parse_money(stake_s)
-
     if dec_odds is None or stake is None or stake <= 0:
         await update.message.reply_text("❌ Check odds/stake. Examples: odds 2.1 or 11/10, stake 25 or £25")
         return
@@ -127,9 +163,9 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bet_id = uuid.uuid4().hex[:8].upper()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # Append 9 values (A..I). Column J (Cumulative Profit) is calculated by your Sheet formula.
+    # Append 10 values (A..J). Column K (Cumulative Profit) is computed by the Sheet formula.
     try:
-        sheet.append_row([bet_id, now, selection, dec_odds, bookmaker, stake, "Pending", "", ""])
+        sheet.append_row([bet_id, now, tipster, selection, dec_odds, bookmaker, stake, "Pending", "", ""])
     except Exception as e:
         await update.message.reply_text(f"⚠️ Could not write to Google Sheet: {e}")
         return
@@ -141,7 +177,7 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]]
     text = (
         f"✅ Bet logged (ID: {bet_id})\n"
-        f"{selection} @ {dec_odds:.2f} ({bookmaker}) {fmt_money(stake)}\n"
+        f"[{tipster}] {selection} @ {dec_odds:.2f} ({bookmaker}) {fmt_money(stake)}\n"
         f"Status: Pending"
     )
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -156,22 +192,22 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ Could not find this bet in the sheet.")
             return
 
-        # Read unformatted numbers to avoid "£50.00" parsing issues
+        # Read unformatted numbers to avoid currency parsing issues
         values = sheet.row_values(row, value_render_option='UNFORMATTED_VALUE')
-        # Columns: [0]ID [1]Date [2]Selection [3]Odds [4]Bookmaker [5]Stake [6]Status [7]Return [8]Profit [9]CumProfit
-        dec_odds = float(values[3])
-        stake = float(values[5])
+        # Indexes: 0 ID, 1 Date, 2 Tipster, 3 Selection, 4 Odds, 5 Bookmaker, 6 Stake, 7 Status, 8 Return, 9 Profit, 10 CumProfit
+        dec_odds = float(values[4])
+        stake = float(values[6])
 
         ret, prof = calc_return_profit(result, dec_odds, stake)
 
-        # Update Status, Return, Profit
-        sheet.update_cell(row, 7, result)       # G: Status
-        sheet.update_cell(row, 8, f"{ret:.2f}") # H: Return
-        sheet.update_cell(row, 9, f"{prof:.2f}")# I: Profit
+        # Update Status (H col=8), Return (I col=9), Profit (J col=10)
+        sheet.update_cell(row, 8, result)
+        sheet.update_cell(row, 9, f"{ret:.2f}")
+        sheet.update_cell(row, 10, f"{prof:.2f}")
 
         new_text = (
             f"📝 Bet (ID: {bet_id})\n"
-            f"{values[2]} @ {dec_odds:.2f} ({values[4]}) {fmt_money(stake)}\n"
+            f"[{values[2]}] {values[3]} @ {dec_odds:.2f} ({values[5]}) {fmt_money(stake)}\n"
             f"Result: {result} • Return: {fmt_money(ret)} • Profit: {fmt_money(prof)}"
         )
         await query.edit_message_text(new_text)
@@ -181,13 +217,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------ MAIN ------------------
 def main():
     if not TOKEN:
-        raise RuntimeError("Set TELEGRAM_BOT_TOKEN in your .env file first.")
+        raise RuntimeError("Set TELEGRAM_BOT_TOKEN in your .env or Render env vars.")
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("tipster", tipster_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_bet))
     app.add_handler(CallbackQueryHandler(button))
     print("Bot running…")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
