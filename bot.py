@@ -249,7 +249,10 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    parts = [p.strip() for p in update.message.text.split("/")]
+    # IMPORTANT: split message into at most 6 parts so the last piece (event date) can contain slashes
+    text = update.message.text.strip()
+    parts = re.split(r"\s*/\s*", text, maxsplit=5)
+
     tipster = None
     event_str = None
 
@@ -325,12 +328,12 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[
         InlineKeyboardButton("✅ Win",  callback_data=f"res|{bet_id}|Win"),
         InlineKeyboardButton("⚪ Void", callback_data=f"res|{bet_id}|Void"),
-        InlineKeyboardButton("❌ Loss", callback_data=f"res|{bet_id}|Loss"),
+        InlineKeyboardButton("❌ Loss",  callback_data=f"res|{bet_id}|Loss"),
     ]]
     shown_event = f"\nEvent: {event_str}" if event_str else ""
     text = (
         f"✅ Bet logged (ID: {bet_id}){shown_event}\n"
-        f"[{tipster}] {selection} @ {dec_odds:.2f} ({bookmaker}) £{stake:,.2f}\n"
+        f"[{tipster}] {selection} @ {dec_odds:.2f} ({bookmaker}) {fmt_money(stake)}\n"
         f"Status: Pending"
     )
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -365,8 +368,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         new_text = (
             f"📝 Bet (ID: {bet_id})\n"
-            f"[{values[3]}] {values[4]} @ {dec_odds:.2f} ({values[6]}) £{stake:,.2f}\n"
-            f"Result: {result} • Return: £{ret:,.2f} • Profit: £{prof:,.2f}"
+            f"[{values[3]}] {values[4]} @ {dec_odds:.2f} ({values[6]}) {fmt_money(stake)}\n"
+            f"Result: {result} • Return: {fmt_money(ret)} • Profit: {fmt_money(prof)}"
         )
         await query.edit_message_text(new_text)
     except Exception as e:
