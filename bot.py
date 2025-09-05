@@ -2,9 +2,9 @@ import os
 import re
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -38,14 +38,13 @@ ss = client.open(SHEET_NAME)
 sheet = ss.worksheet("Bets")  # change if your tab has a different name
 
 def ensure_headers():
-    # Do not delete row 1 (filters/pivots) — just overwrite.
     try:
         _ = sheet.row_values(1)
     except Exception:
         _ = []
     if sheet.col_count < len(HEADERS):
         sheet.add_cols(len(HEADERS) - sheet.col_count)
-    end_a1 = rowcol_to_a1(1, len(HEADERS))  # e.g., A1:L1
+    end_a1 = rowcol_to_a1(1, len(HEADERS))
     sheet.update(values=[HEADERS], range_name=f"A1:{end_a1}")
 
 ensure_headers()
@@ -78,7 +77,6 @@ def set_default_tipster(chat_id: int, name: str):
 UK_TZ = ZoneInfo("Europe/London")
 
 def to_uk_string(dt: datetime) -> str:
-    """Return UK-local timestamp with seconds."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UK_TZ)
     else:
@@ -86,21 +84,15 @@ def to_uk_string(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 def parse_odds(s: str) -> Optional[float]:
-    """
-    Accepts decimal (2.5, 2,50) or fractional (11/10).
-    Ignores stray/non-breaking spaces; returns decimal > 1.0.
-    """
     if not s:
         return None
     s = s.strip().replace("\u00A0", " ").replace("\u202F", " ")
-    # fractional?
     frac = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", s)
     if frac:
         num, den = int(frac.group(1)), int(frac.group(2))
         if den == 0:
             return None
         return 1.0 + (num / den)
-    # decimal
     cleaned = re.sub(r"[^0-9,.\s]", "", s).replace(",", ".").strip()
     try:
         v = float(cleaned)
@@ -109,9 +101,6 @@ def parse_odds(s: str) -> Optional[float]:
         return None
 
 def parse_money(s: str) -> Optional[float]:
-    """
-    Accepts 50, £50, 1,250, 50.00, etc. Ignores symbols/spaces.
-    """
     if not s:
         return None
     s = s.strip().replace("\u00A0", " ").replace("\u202F", " ")
@@ -126,23 +115,11 @@ def parse_money(s: str) -> Optional[float]:
         return None
 
 def parse_event_dt(s: str) -> Optional[str]:
-    """
-    Optional event date parser (UK). Accepts:
-      - 2025-09-05 20:00
-      - 05/09/2025 20:00
-      - 05/09 20:00 (assumes current year)
-      - 20:00 05/09/2025
-      - 20:00 05/09 (assumes current year)
-      - today 19:45
-      - tomorrow 15:00
-    Returns 'YYYY-MM-DD HH:MM:SS' UK time, or None if unparseable.
-    """
     if not s:
         return None
     raw = s.strip().lower()
     now = datetime.now(UK_TZ)
 
-    # today/tomorrow HH:MM
     m = re.fullmatch(r"(today|tomorrow)\s+(\d{1,2}):(\d{2})", raw)
     if m:
         day_word, hh, mm = m.group(1), int(m.group(2)), int(m.group(3))
@@ -150,7 +127,6 @@ def parse_event_dt(s: str) -> Optional[str]:
         dt = datetime(base.year, base.month, base.day, hh, mm, tzinfo=UK_TZ)
         return to_uk_string(dt)
 
-    # explicit with year (DATE first)
     for fmt in ("%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M", "%d %b %Y %H:%M", "%d %B %Y %H:%M"):
         try:
             dt_naive = datetime.strptime(raw, fmt)
@@ -158,8 +134,6 @@ def parse_event_dt(s: str) -> Optional[str]:
             return to_uk_string(dt)
         except ValueError:
             pass
-
-    # explicit with year (TIME first)
     for fmt in ("%H:%M %d/%m/%Y", "%H:%M %d-%m-%Y", "%H:%M %d %b %Y", "%H:%M %d %B %Y"):
         try:
             dt_naive = datetime.strptime(raw, fmt)
@@ -168,26 +142,22 @@ def parse_event_dt(s: str) -> Optional[str]:
         except ValueError:
             pass
 
-    # no-year DATE first: 05/09 20:00  → assume current year
     m = re.fullmatch(r"(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})", raw)
     if m:
         d, mth, hh, mm = map(int, m.groups())
         try:
-            dt = datetime(now.year, mth, d, hh, mm, tzinfo=UK_TZ)
+            dt = datetime(datetime.now().year, mth, d, hh, mm, tzinfo=UK_TZ)
             return to_uk_string(dt)
         except ValueError:
             return None
-
-    # no-year TIME first: 20:00 05/09  → assume current year
     m = re.fullmatch(r"(\d{1,2}):(\d{2})\s+(\d{1,2})/(\d{1,2})", raw)
     if m:
         hh, mm, d, mth = map(int, m.groups())
         try:
-            dt = datetime(now.year, mth, d, hh, mm, tzinfo=UK_TZ)
+            dt = datetime(datetime.now().year, mth, d, hh, mm, tzinfo=UK_TZ)
             return to_uk_string(dt)
         except ValueError:
             return None
-
     return None
 
 def calc_return_profit(result: str, dec_odds: float, stake: float) -> Tuple[float, float]:
@@ -198,7 +168,7 @@ def calc_return_profit(result: str, dec_odds: float, stake: float) -> Tuple[floa
     return round(stake, 2), 0.0  # Void
 
 def find_row_by_id(bet_id: str) -> Optional[int]:
-    ids = sheet.col_values(1)  # Column A
+    ids = sheet.col_values(1)
     for idx, v in enumerate(ids, start=1):
         if v == bet_id:
             return idx
@@ -206,6 +176,27 @@ def find_row_by_id(bet_id: str) -> Optional[int]:
 
 def fmt_money(v: float) -> str:
     return f"£{v:,.2f}"
+
+# ----- robust date reading from Sheets (handles strings & serials) -----
+EXCEL_EPOCH = datetime(1899, 12, 30, tzinfo=UK_TZ)  # Google/Excel serial date epoch
+def to_datetime_uk(val) -> Optional[datetime]:
+    if val is None or val == "":
+        return None
+    # numeric serial?
+    try:
+        f = float(val)
+        return EXCEL_EPOCH + timedelta(days=f)
+    except Exception:
+        pass
+    s = str(val).strip()
+    # try our formats (with seconds and without)
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=UK_TZ)
+            return dt
+        except ValueError:
+            continue
+    return None
 
 # ------------------ BOT HANDLERS ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -215,7 +206,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• With tipster (5): `Tipster / Selection / Odds / Bookmaker / Stake`\n"
         "• No tipster (4): `Selection / Odds / Bookmaker / Stake`\n"
         "• Optional event date LAST: `... / 05/09/2025 20:00` or `... / 20:00 05/09/2025` or `... / tomorrow 19:45`\n\n"
-        f"Set default tipster: `/tipster <name>` (current: *{current}*)"
+        "Other commands:\n"
+        "• `/tipster <name>` — set default tipster for this chat\n"
+        "• `/summary` — tipster P/L for the current month"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -242,7 +235,6 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    # IMPORTANT: split into at most 6 parts so the last piece (event date) can contain slashes
     text = update.message.text.strip()
     parts = re.split(r"\s*/\s*", text, maxsplit=5)
 
@@ -250,21 +242,16 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     event_str = None
 
     if len(parts) == 6:
-        # Tipster + Event Date provided
         tipster, selection, odds_s, bookmaker, stake_s, event_raw = parts
         event_str = parse_event_dt(event_raw)
         if event_raw and event_str is None:
             await update.message.reply_text("❌ Couldn't read the event date/time. Try '2025-09-05 20:00', '20:00 05/09/2025', or 'tomorrow 19:45'.")
             return
-
     elif len(parts) == 5:
-        # Ambiguous: (A) tipster/no-date OR (B) no-tipster/with-date.
         A_tipster, A_selection, A_odds, A_book, A_stake = parts
         B_selection, B_odds, B_book, B_stake, B_event = parts
-
         a_ok = _looks_like_odds(A_odds) and _looks_like_money(A_stake)
         b_ok = _looks_like_odds(B_odds) and _looks_like_money(B_stake) and _looks_like_date(B_event)
-
         if a_ok and not b_ok:
             tipster, selection, odds_s, bookmaker, stake_s = parts
         elif b_ok and not a_ok:
@@ -280,12 +267,9 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• Selection / Odds / Bookmaker / Stake / EventDateTime"
             )
             return
-
     elif len(parts) == 4:
-        # No event date, use default tipster
         tipster = get_default_tipster(update.effective_chat.id)
         selection, odds_s, bookmaker, stake_s = parts
-
     else:
         await update.message.reply_text(
             "❌ Format error. Use one of:\n"
@@ -305,14 +289,13 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tipster or tipster.strip() == "":
         tipster = "Unknown"
 
-    # Build row
     bet_id = uuid.uuid4().hex[:8].upper()
-    now = datetime.now(UK_TZ).strftime("%Y-%m-%d %H:%M:%S")  # with seconds
+    now = datetime.now(UK_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     try:
         sheet.append_row(
             [bet_id, now, (event_str or ""), tipster, selection, dec_odds, bookmaker, stake, "Pending", "", "", ""],
-            value_input_option="USER_ENTERED"  # let Sheets parse datetimes & numbers
+            value_input_option="USER_ENTERED"
         )
     except Exception as e:
         await update.message.reply_text(f"⚠️ Could not write to Google Sheet: {e}")
@@ -342,7 +325,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         values = sheet.row_values(row, value_render_option='UNFORMATTED_VALUE')
-        # Indexes: 0 ID,1 DatePlaced,2 EventDate,3 Tipster,4 Selection,5 Odds,6 Bookmaker,7 Stake,8 Status,9 Return,10 Profit,11 CumProfit
         dec_odds = float(values[5])
         stake = float(values[7])
 
@@ -360,9 +342,92 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await query.edit_message_text(f"⚠️ Error: {e}")
 
+# --------- /summary (P/L per tipster this month) ----------
+def month_bounds_uk(today: Optional[date] = None) -> Tuple[datetime, datetime]:
+    tz = UK_TZ
+    if today is None:
+        today = datetime.now(tz).date()
+    start = datetime(today.year, today.month, 1, 0, 0, 0, tzinfo=tz)
+    # last day: go to 1st of next month minus 1 second
+    if today.month == 12:
+        next_first = datetime(today.year + 1, 1, 1, tzinfo=tz)
+    else:
+        next_first = datetime(today.year, today.month + 1, 1, tzinfo=tz)
+    end = next_first - timedelta(seconds=1)
+    return start, end
+
+async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Read all rows (2..)
+    rows = sheet.get_all_values()
+    if not rows or len(rows) <= 1:
+        await update.message.reply_text("No data yet.")
+        return
+    data = rows[1:]  # skip header
+
+    start_dt, end_dt = month_bounds_uk()
+    stats: Dict[str, Dict[str, float]] = {}  # tipster -> {bets, staked, ret, prof}
+
+    for r in data:
+        # Guard rows with fewer columns
+        if len(r) < 12:
+            continue
+        date_placed = to_datetime_uk(r[1])   # Column B
+        tipster = (r[3] or "Unknown").strip()  # Column D
+        status = (r[8] or "").strip()        # Column I
+        stake_s, ret_s, prof_s = r[7], r[9], r[10]  # H, J, K
+
+        if status == "" or status.lower() == "pending":
+            continue
+        if not date_placed:
+            continue
+        if not (start_dt <= date_placed <= end_dt):
+            continue
+
+        # numeric coercion
+        def to_num(x):
+            try:
+                return float(str(x).replace(",", ""))
+            except Exception:
+                return 0.0
+
+        stake = to_num(stake_s)
+        ret = to_num(ret_s)
+        prof = to_num(prof_s)
+
+        t = stats.setdefault(tipster, {"bets": 0, "staked": 0.0, "ret": 0.0, "prof": 0.0})
+        t["bets"] += 1
+        t["staked"] += stake
+        t["ret"] += ret
+        t["prof"] += prof
+
+    if not stats:
+        month_name = start_dt.strftime("%B %Y")
+        await update.message.reply_text(f"No settled bets for {month_name}.")
+        return
+
+    # sort by profit desc
+    items = sorted(stats.items(), key=lambda kv: kv[1]["prof"], reverse=True)
+
+    # Build a monospace table
+    def fmt_money(v): return f"£{v:,.2f}"
+    lines: List[str] = []
+    month_name = start_dt.strftime("%B %Y")
+    lines.append(f"Tipster P/L — {month_name}")
+    lines.append("")
+    header = f"{'Tipster':<18} {'Bets':>4} {'Staked':>12} {'Return':>12} {'Profit':>12}"
+    lines.append(header)
+    lines.append("-" * len(header))
+    total_bets = total_stake = total_ret = total_prof = 0
+    for tip, s in items:
+        lines.append(f"{tip:<18} {s['bets']:>4} {fmt_money(s['staked']):>12} {fmt_money(s['ret']):>12} {fmt_money(s['prof']):>12}")
+        total_bets += s["bets"]; total_stake += s["staked"]; total_ret += s["ret"]; total_prof += s["prof"]
+    lines.append("-" * len(header))
+    lines.append(f"{'Total':<18} {total_bets:>4} {fmt_money(total_stake):>12} {fmt_money(total_ret):>12} {fmt_money(total_prof):>12}")
+
+    await update.message.reply_text("```\n" + "\n".join(lines) + "\n```", parse_mode="Markdown")
+
 # ------------------ MAIN ------------------
 async def _post_init(app: Application):
-    # Ensure no webhook is set (avoids conflicts with polling)
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception:
@@ -374,6 +439,7 @@ def main():
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("tipster", tipster_cmd))
+    app.add_handler(CommandHandler("summary", summary_cmd))   # <-- NEW
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_bet))
     app.add_handler(CallbackQueryHandler(button))
     print("Bot running…")
