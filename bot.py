@@ -358,7 +358,7 @@ def month_bounds_uk(today: Optional[date] = None) -> Tuple[datetime, datetime]:
 
 async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Read all rows (2..)
-    rows = sheet.get_all_values()
+    rows = sheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
     if not rows or len(rows) <= 1:
         await update.message.reply_text("No data yet.")
         return
@@ -385,10 +385,15 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # numeric coercion
         def to_num(x):
-            try:
-                return float(str(x).replace(",", ""))
-            except Exception:
-                return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x)
+    # strip currency symbols and thousands separators
+    s = s.replace("£", "").replace(",", "").strip()
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
 
         stake = to_num(stake_s)
         ret = to_num(ret_s)
