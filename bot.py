@@ -18,7 +18,7 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # ------------------ SHEETS SETUP ------------------
-SHEET_NAME = "Bet Tracker"  # Your Google Sheet (file) name
+SHEET_NAME = "Bet Tracker"  # Google Sheet (file) name
 HEADERS = [
     "ID", "Date Placed", "Event Date", "Tipster", "Selection",
     "Odds (dec)", "Bookmaker", "Stake", "Status", "Return",
@@ -35,7 +35,7 @@ else:
 
 client = gspread.authorize(CREDS)
 ss = client.open(SHEET_NAME)
-sheet = ss.worksheet("Bets")  # change if your tab has a different name
+sheet = ss.worksheet("Bets")  # change if your tab name differs
 
 def ensure_headers():
     try:
@@ -75,8 +75,10 @@ def set_default_tipster(chat_id: int, name: str):
 
 # ------------------ HELPERS ------------------
 UK_TZ = ZoneInfo("Europe/London")
+EXCEL_EPOCH = datetime(1899, 12, 30, tzinfo=UK_TZ)  # Google/Excel serial epoch
 
 def to_uk_string(dt: datetime) -> str:
+    """Return UK-local timestamp with seconds."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UK_TZ)
     else:
@@ -84,15 +86,18 @@ def to_uk_string(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 def parse_odds(s: str) -> Optional[float]:
+    """Decimal (2.5/2,50) or fractional (11/10)."""
     if not s:
         return None
     s = s.strip().replace("\u00A0", " ").replace("\u202F", " ")
+    # fractional?
     frac = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", s)
     if frac:
         num, den = int(frac.group(1)), int(frac.group(2))
         if den == 0:
             return None
         return 1.0 + (num / den)
+    # decimal
     cleaned = re.sub(r"[^0-9,.\s]", "", s).replace(",", ".").strip()
     try:
         v = float(cleaned)
@@ -101,6 +106,7 @@ def parse_odds(s: str) -> Optional[float]:
         return None
 
 def parse_money(s: str) -> Optional[float]:
+    """50, £50, 1,250, 50.00, etc."""
     if not s:
         return None
     s = s.strip().replace("\u00A0", " ").replace("\u202F", " ")
@@ -113,52 +119,6 @@ def parse_money(s: str) -> Optional[float]:
         return round(v, 2) if v > 0 else None
     except ValueError:
         return None
-
-def parse_event_dt(s: str) -> Optional[str]:
-    if not s:
-        return None
-    raw = s.strip().lower()
-    now = datetime.now(UK_TZ)
-
-    m = re.fullmatch(r"(today|tomorrow)\s+(\d{1,2}):(\d{2})", raw)
-    if m:
-        day_word, hh, mm = m.group(1), int(m.group(2)), int(m.group(3))
-        base = now.date() if day_word == "today" else (now + timedelta(days=1)).date()
-        dt = datetime(base.year, base.month, base.day, hh, mm, tzinfo=UK_TZ)
-        return to_uk_string(dt)
-
-    for fmt in ("%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M", "%d %b %Y %H:%M", "%d %B %Y %H:%M"):
-        try:
-            dt_naive = datetime.strptime(raw, fmt)
-            dt = dt_naive.replace(tzinfo=UK_TZ)
-            return to_uk_string(dt)
-        except ValueError:
-            pass
-    for fmt in ("%H:%M %d/%m/%Y", "%H:%M %d-%m-%Y", "%H:%M %d %b %Y", "%H:%M %d %B %Y"):
-        try:
-            dt_naive = datetime.strptime(raw, fmt)
-            dt = dt_naive.replace(tzinfo=UK_TZ)
-            return to_uk_string(dt)
-        except ValueError:
-            pass
-
-    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})", raw)
-    if m:
-        d, mth, hh, mm = map(int, m.groups())
-        try:
-            dt = datetime(datetime.now().year, mth, d, hh, mm, tzinfo=UK_TZ)
-            return to_uk_string(dt)
-        except ValueError:
-            return None
-    m = re.fullmatch(r"(\d{1,2}):(\d{2})\s+(\d{1,2})/(\d{1,2})", raw)
-    if m:
-        hh, mm, d, mth = map(int, m.groups())
-        try:
-            dt = datetime(datetime.now().year, mth, d, hh, mm, tzinfo=UK_TZ)
-            return to_uk_string(dt)
-        except ValueError:
-            return None
-    return None
 
 def calc_return_profit(result: str, dec_odds: float, stake: float) -> Tuple[float, float]:
     if result == "Win":
@@ -177,8 +137,7 @@ def find_row_by_id(bet_id: str) -> Optional[int]:
 def fmt_money(v: float) -> str:
     return f"£{v:,.2f}"
 
-# ----- robust date reading from Sheets (handles strings & serials) -----
-EXCEL_EPOCH = datetime(1899, 12, 30, tzinfo=UK_TZ)  # Google/Excel serial date epoch
+# Robust date reading from Sheets (handles strings & serials)
 def to_datetime_uk(val) -> Optional[datetime]:
     if val is None or val == "":
         return None
@@ -189,7 +148,6 @@ def to_datetime_uk(val) -> Optional[datetime]:
     except Exception:
         pass
     s = str(val).strip()
-    # try our formats (with seconds and without)
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
         try:
             dt = datetime.strptime(s, fmt).replace(tzinfo=UK_TZ)
@@ -204,8 +162,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "Send bets:\n"
         "• With tipster (5): `Tipster / Selection / Odds / Bookmaker / Stake`\n"
-        "• No tipster (4): `Selection / Odds / Bookmaker / Stake`\n"
-        "• Optional event date LAST: `... / 05/09/2025 20:00` or `... / 20:00 05/09/2025` or `... / tomorrow 19:45`\n\n"
+        "• No tipster (4): `Selection / Odds / Bookmaker / Stake`\n\n"
         "Other commands:\n"
         "• `/tipster <name>` — set default tipster for this chat\n"
         "• `/summary` — tipster P/L for the current month"
@@ -224,61 +181,19 @@ async def tipster_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_default_tipster(update.effective_chat.id, name)
     await update.message.reply_text(f"✅ Default tipster set to: {name}")
 
-def _looks_like_date(s: str) -> bool:
-    return parse_event_dt(s) is not None
-def _looks_like_odds(s: str) -> bool:
-    return parse_odds(s) is not None
-def _looks_like_money(s: str) -> bool:
-    return parse_money(s) is not None
-
 async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
+    parts = re.split(r"\s*/\s*", update.message.text.strip())
+    if len(parts) not in (4, 5):
+        await update.message.reply_text("❌ Format: Tipster / Selection / Odds / Bookmaker / Stake")
+        return
 
-    text = update.message.text.strip()
-    parts = re.split(r"\s*/\s*", text, maxsplit=5)
-
-    tipster = None
-    event_str = None
-
-    if len(parts) == 6:
-        tipster, selection, odds_s, bookmaker, stake_s, event_raw = parts
-        event_str = parse_event_dt(event_raw)
-        if event_raw and event_str is None:
-            await update.message.reply_text("❌ Couldn't read the event date/time. Try '2025-09-05 20:00', '20:00 05/09/2025', or 'tomorrow 19:45'.")
-            return
-    elif len(parts) == 5:
-        A_tipster, A_selection, A_odds, A_book, A_stake = parts
-        B_selection, B_odds, B_book, B_stake, B_event = parts
-        a_ok = _looks_like_odds(A_odds) and _looks_like_money(A_stake)
-        b_ok = _looks_like_odds(B_odds) and _looks_like_money(B_stake) and _looks_like_date(B_event)
-        if a_ok and not b_ok:
-            tipster, selection, odds_s, bookmaker, stake_s = parts
-        elif b_ok and not a_ok:
-            selection, odds_s, bookmaker, stake_s, event_raw = parts
-            tipster = get_default_tipster(update.effective_chat.id)
-            event_str = parse_event_dt(event_raw)
-        elif a_ok and b_ok:
-            tipster, selection, odds_s, bookmaker, stake_s = parts
-        else:
-            await update.message.reply_text(
-                "❌ I couldn't understand that. Use one of:\n"
-                "• Tipster / Selection / Odds / Bookmaker / Stake\n"
-                "• Selection / Odds / Bookmaker / Stake / EventDateTime"
-            )
-            return
-    elif len(parts) == 4:
+    if len(parts) == 5:
+        tipster, selection, odds_s, bookmaker, stake_s = parts
+    else:
         tipster = get_default_tipster(update.effective_chat.id)
         selection, odds_s, bookmaker, stake_s = parts
-    else:
-        await update.message.reply_text(
-            "❌ Format error. Use one of:\n"
-            "• Tipster / Selection / Odds / Bookmaker / Stake\n"
-            "• Selection / Odds / Bookmaker / Stake\n"
-            "• Tipster / Selection / Odds / Bookmaker / Stake / EventDateTime\n"
-            "• Selection / Odds / Bookmaker / Stake / EventDateTime"
-        )
-        return
 
     dec_odds = parse_odds(odds_s)
     stake = parse_money(stake_s)
@@ -294,7 +209,7 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         sheet.append_row(
-            [bet_id, now, (event_str or ""), tipster, selection, dec_odds, bookmaker, stake, "Pending", "", "", ""],
+            [bet_id, now, "", tipster, selection, dec_odds, bookmaker, stake, "Pending", "", "", ""],
             value_input_option="USER_ENTERED"
         )
     except Exception as e:
@@ -306,9 +221,8 @@ async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("⚪ Void", callback_data=f"res|{bet_id}|Void"),
         InlineKeyboardButton("❌ Loss", callback_data=f"res|{bet_id}|Loss"),
     ]]
-    shown_event = f"\nEvent: {event_str}" if event_str else ""
     text = (
-        f"✅ Bet logged (ID: {bet_id}){shown_event}\n"
+        f"✅ Bet logged (ID: {bet_id})\n"
         f"[{tipster}] {selection} @ {dec_odds:.2f} ({bookmaker}) {fmt_money(stake)}\n"
         f"Status: Pending"
     )
@@ -323,15 +237,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not row:
             await query.edit_message_text("⚠️ Could not find this bet in the sheet.")
             return
-
         values = sheet.row_values(row, value_render_option='UNFORMATTED_VALUE')
         dec_odds = float(values[5])
         stake = float(values[7])
 
         ret, prof = calc_return_profit(result, dec_odds, stake)
-        sheet.update_cell(row, 9, result)          # I: Status
-        sheet.update_cell(row, 10, f"{ret:.2f}")   # J: Return
-        sheet.update_cell(row, 11, f"{prof:.2f}")  # K: Profit
+        sheet.update_cell(row, 9, result)          # Status
+        sheet.update_cell(row, 10, f"{ret:.2f}")   # Return
+        sheet.update_cell(row, 11, f"{prof:.2f}")  # Profit
 
         new_text = (
             f"📝 Bet (ID: {bet_id})\n"
@@ -348,7 +261,6 @@ def month_bounds_uk(today: Optional[date] = None) -> Tuple[datetime, datetime]:
     if today is None:
         today = datetime.now(tz).date()
     start = datetime(today.year, today.month, 1, 0, 0, 0, tzinfo=tz)
-    # last day: go to 1st of next month minus 1 second
     if today.month == 12:
         next_first = datetime(today.year + 1, 1, 1, tzinfo=tz)
     else:
@@ -357,7 +269,6 @@ def month_bounds_uk(today: Optional[date] = None) -> Tuple[datetime, datetime]:
     return start, end
 
 async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Read all rows (2..)
     rows = sheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
     if not rows or len(rows) <= 1:
         await update.message.reply_text("No data yet.")
@@ -365,27 +276,9 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = rows[1:]  # skip header
 
     start_dt, end_dt = month_bounds_uk()
-    stats: Dict[str, Dict[str, float]] = {}  # tipster -> {bets, staked, ret, prof}
+    stats: Dict[str, Dict[str, float]] = {}
 
-    for r in data:
-        # Guard rows with fewer columns
-        if len(r) < 12:
-            continue
-        date_placed = to_datetime_uk(r[1])   # Column B
-        tipster = (r[3] or "Unknown").strip()  # Column D
-        status = (r[8] or "").strip()        # Column I
-        stake_s, ret_s, prof_s = r[7], r[9], r[10]  # H, J, K
-
-        if status == "" or status.lower() == "pending":
-            continue
-        if not date_placed:
-            continue
-        if not (start_dt <= date_placed <= end_dt):
-            continue
-
-        # numeric coercion
-       def to_num(x):
-        # handle numbers directly and strings like "£50.00", "1,250"
+    def to_num(x):
         if isinstance(x, (int, float)):
             return float(x)
         s = str(x).replace("£", "").replace(",", "").strip()
@@ -393,6 +286,21 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return float(s)
         except Exception:
             return 0.0
+
+    for r in data:
+        if len(r) < 12:
+            continue
+        date_placed = to_datetime_uk(r[1])   # Column B
+        tipster = (r[3] or "Unknown").strip()
+        status = (r[8] or "").strip()
+        stake_s, ret_s, prof_s = r[7], r[9], r[10]
+
+        if status == "" or status.lower() == "pending":
+            continue
+        if not date_placed:
+            continue
+        if not (start_dt <= date_placed <= end_dt):
+            continue
 
         stake = to_num(stake_s)
         ret = to_num(ret_s)
@@ -409,11 +317,9 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No settled bets for {month_name}.")
         return
 
-    # sort by profit desc
     items = sorted(stats.items(), key=lambda kv: kv[1]["prof"], reverse=True)
 
-    # Build a monospace table
-    def fmt_money(v): return f"£{v:,.2f}"
+    def fmt_money2(v): return f"£{v:,.2f}"
     lines: List[str] = []
     month_name = start_dt.strftime("%B %Y")
     lines.append(f"Tipster P/L — {month_name}")
@@ -421,12 +327,13 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     header = f"{'Tipster':<18} {'Bets':>4} {'Staked':>12} {'Return':>12} {'Profit':>12}"
     lines.append(header)
     lines.append("-" * len(header))
-    total_bets = total_stake = total_ret = total_prof = 0
+    total_bets = 0
+    total_stake = total_ret = total_prof = 0.0
     for tip, s in items:
-        lines.append(f"{tip:<18} {s['bets']:>4} {fmt_money(s['staked']):>12} {fmt_money(s['ret']):>12} {fmt_money(s['prof']):>12}")
+        lines.append(f"{tip:<18} {s['bets']:>4} {fmt_money2(s['staked']):>12} {fmt_money2(s['ret']):>12} {fmt_money2(s['prof']):>12}")
         total_bets += s["bets"]; total_stake += s["staked"]; total_ret += s["ret"]; total_prof += s["prof"]
     lines.append("-" * len(header))
-    lines.append(f"{'Total':<18} {total_bets:>4} {fmt_money(total_stake):>12} {fmt_money(total_ret):>12} {fmt_money(total_prof):>12}")
+    lines.append(f"{'Total':<18} {total_bets:>4} {fmt_money2(total_stake):>12} {fmt_money2(total_ret):>12} {fmt_money2(total_prof):>12}")
 
     await update.message.reply_text("```\n" + "\n".join(lines) + "\n```", parse_mode="Markdown")
 
@@ -443,7 +350,7 @@ def main():
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("tipster", tipster_cmd))
-    app.add_handler(CommandHandler("summary", summary_cmd))   # <-- NEW
+    app.add_handler(CommandHandler("summary", summary_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_bet))
     app.add_handler(CallbackQueryHandler(button))
     print("Bot running…")
