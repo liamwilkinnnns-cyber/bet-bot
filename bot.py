@@ -384,16 +384,15 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         # numeric coercion
-        def to_num(x):
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x)
-    # strip currency symbols and thousands separators
-    s = s.replace("£", "").replace(",", "").strip()
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
+       def to_num(x):
+        # handle numbers directly and strings like "£50.00", "1,250"
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).replace("£", "").replace(",", "").strip()
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
 
         stake = to_num(stake_s)
         ret = to_num(ret_s)
