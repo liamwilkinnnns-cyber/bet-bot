@@ -1,360 +1,309 @@
-import os
-import re
-import json
-import uuid
-from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo
-from typing import Optional, Tuple, List, Dict
+# bot.py
+# Requires: pyTelegramBotAPI, gspread, google-auth, pandas, python-dateutil, pytz
+# env vars: TELEGRAM_BOT_TOKEN, GOOGLE_CREDS_JSON, SHEET_NAME=Bet Tracker, SHEET_TAB=Bets
 
-from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import os, json, re
+from datetime import datetime, timedelta
+import pytz
+from dateutil.relativedelta import relativedelta
+from dateutil import parser as dtparser
+import pandas as pd
+import telebot
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from gspread.utils import rowcol_to_a1
+from google.oauth2.service_account import Credentials
 
-# ------------------ ENV ------------------
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# --------------------------
+# Config
+# --------------------------
+TZ = pytz.timezone("Europe/London")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+SHEET_NAME = os.getenv("SHEET_NAME", "Bet Tracker").strip()
+SHEET_TAB  = os.getenv("SHEET_TAB",  "Bets").strip()
 
-# ------------------ SHEETS SETUP ------------------
-SHEET_NAME = "Bet Tracker"  # Google Sheet (file) name
-HEADERS = [
-    "ID", "Date Placed", "Event Date", "Tipster", "Selection",
-    "Odds (dec)", "Bookmaker", "Stake", "Status", "Return",
-    "Profit", "Cumulative Profit"
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
+
+# Google client (service account JSON string in env)
+creds_json = os.getenv("GOOGLE_CREDS_JSON", "")
+if not creds_json:
+    raise RuntimeError("GOOGLE_CREDS_JSON missing")
+creds_dict = json.loads(creds_json)
+scopes = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
 ]
-SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+gc = gspread.authorize(creds)
 
-# Prefer GOOGLE_CREDS_JSON on hosts like Render. Fallback to local file on your Mac.
-if os.getenv("GOOGLE_CREDS_JSON"):
-    creds_dict = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
-    CREDS = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
-else:
-    CREDS = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", SCOPE)
+bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 
-client = gspread.authorize(CREDS)
-ss = client.open(SHEET_NAME)
-sheet = ss.worksheet("Bets")  # change if your tab name differs
+# --------------------------
+# Helpers
+# --------------------------
+NUM_RE = re.compile(r"[^\d.\-]")  # strip everything except digits, dot, minus
 
-def ensure_headers():
-    try:
-        _ = sheet.row_values(1)
-    except Exception:
-        _ = []
-    if sheet.col_count < len(HEADERS):
-        sheet.add_cols(len(HEADERS) - sheet.col_count)
-    end_a1 = rowcol_to_a1(1, len(HEADERS))
-    sheet.update(values=[HEADERS], range_name=f"A1:{end_a1}")
-
-ensure_headers()
-
-# ------------------ SIMPLE PREFS (default tipster per chat) ------------------
-PREFS_FILE = "prefs.json"  # best-effort file; on some hosts this is ephemeral
-def load_prefs():
-    if os.path.exists(PREFS_FILE):
-        try:
-            with open(PREFS_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-def save_prefs(p):
-    try:
-        with open(PREFS_FILE, "w") as f:
-            json.dump(p, f, indent=2)
-    except Exception:
-        pass
-
-PREFS = load_prefs()
-def get_default_tipster(chat_id: int) -> str:
-    return PREFS.get(str(chat_id), {}).get("tipster", "Unknown")
-def set_default_tipster(chat_id: int, name: str):
-    PREFS[str(chat_id)] = {"tipster": name}
-    save_prefs(PREFS)
-
-# ------------------ HELPERS ------------------
-UK_TZ = ZoneInfo("Europe/London")
-EXCEL_EPOCH = datetime(1899, 12, 30, tzinfo=UK_TZ)  # Google/Excel serial epoch
-
-def to_uk_string(dt: datetime) -> str:
-    """Return UK-local timestamp with seconds."""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UK_TZ)
-    else:
-        dt = dt.astimezone(UK_TZ)
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-def parse_odds(s: str) -> Optional[float]:
-    """Decimal (2.5/2,50) or fractional (11/10)."""
+def parse_money(x):
+    """'£1,250.50' -> 1250.50 ; also handles None/'' """
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).replace("\u00a0", " ").strip()  # nbsp
     if not s:
-        return None
-    s = s.strip().replace("\u00A0", " ").replace("\u202F", " ")
-    # fractional?
-    frac = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", s)
-    if frac:
-        num, den = int(frac.group(1)), int(frac.group(2))
-        if den == 0:
-            return None
-        return 1.0 + (num / den)
-    # decimal
-    cleaned = re.sub(r"[^0-9,.\s]", "", s).replace(",", ".").strip()
-    try:
-        v = float(cleaned)
-        return v if v > 1.0 else None
-    except ValueError:
-        return None
-
-def parse_money(s: str) -> Optional[float]:
-    """50, £50, 1,250, 50.00, etc."""
-    if not s:
-        return None
-    s = s.strip().replace("\u00A0", " ").replace("\u202F", " ")
-    cleaned = re.sub(r"[^0-9.]", "", s)
-    parts = cleaned.split(".")
+        return 0.0
+    s = s.replace(",", "")  # drop thousands sep
+    s = s.replace("£", "")
+    # keep last dot if someone pasted "1.234.56"
+    parts = s.split(".")
     if len(parts) > 2:
-        cleaned = "".join(parts[:-1]) + "." + parts[-1]
+        s = "".join(parts[:-1]) + "." + parts[-1]
     try:
-        v = float(cleaned)
-        return round(v, 2) if v > 0 else None
+        return float(s)
     except ValueError:
-        return None
+        s2 = NUM_RE.sub("", s)
+        return float(s2) if s2 else 0.0
 
-def calc_return_profit(result: str, dec_odds: float, stake: float) -> Tuple[float, float]:
-    if result == "Win":
-        ret = round(dec_odds * stake, 2);  return ret, round(ret - stake, 2)
-    if result == "Loss":
-        return 0.0, round(-stake, 2)
-    return round(stake, 2), 0.0  # Void
-
-def find_row_by_id(bet_id: str) -> Optional[int]:
-    ids = sheet.col_values(1)
-    for idx, v in enumerate(ids, start=1):
-        if v == bet_id:
-            return idx
-    return None
-
-def fmt_money(v: float) -> str:
-    return f"£{v:,.2f}"
-
-# Robust date reading from Sheets (handles strings & serials)
-def to_datetime_uk(val) -> Optional[datetime]:
-    if val is None or val == "":
-        return None
-    # numeric serial?
-    try:
-        f = float(val)
-        return EXCEL_EPOCH + timedelta(days=f)
-    except Exception:
-        pass
-    s = str(val).strip()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
-        try:
-            dt = datetime.strptime(s, fmt).replace(tzinfo=UK_TZ)
-            return dt
-        except ValueError:
-            continue
-    return None
-
-# ------------------ BOT HANDLERS ------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    current = get_default_tipster(update.effective_chat.id)
-    msg = (
-        "Send bets:\n"
-        "• With tipster (5): `Tipster / Selection / Odds / Bookmaker / Stake`\n"
-        "• No tipster (4): `Selection / Odds / Bookmaker / Stake`\n\n"
-        "Other commands:\n"
-        "• `/tipster <name>` — set default tipster for this chat\n"
-        "• `/summary` — tipster P/L for the current month"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def tipster_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        current = get_default_tipster(update.effective_chat.id)
-        await update.message.reply_text(
-            f"Current default tipster: {current}\nSet it with `/tipster <name>`.",
-            parse_mode="Markdown"
-        )
-        return
-    name = " ".join(context.args).strip()
-    set_default_tipster(update.effective_chat.id, name)
-    await update.message.reply_text(f"✅ Default tipster set to: {name}")
-
-async def log_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-    parts = re.split(r"\s*/\s*", update.message.text.strip())
-    if len(parts) not in (4, 5):
-        await update.message.reply_text("❌ Format: Tipster / Selection / Odds / Bookmaker / Stake")
-        return
-
-    if len(parts) == 5:
-        tipster, selection, odds_s, bookmaker, stake_s = parts
+def parse_datetime_london(s):
+    """
+    Tries multiple formats; treats naive times as Europe/London.
+    Returns timezone-aware datetime.
+    """
+    if isinstance(s, datetime):
+        dt = s
     else:
-        tipster = get_default_tipster(update.effective_chat.id)
-        selection, odds_s, bookmaker, stake_s = parts
+        s = str(s).strip()
+        # Common sheet formats first
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+                    "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
+                    "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M",
+                    "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                break
+            except ValueError:
+                dt = None
+        if dt is None:
+            # Fallback to dateutil
+            try:
+                # dayfirst for UK-like inputs
+                dt = dtparser.parse(s, dayfirst=True)
+            except Exception:
+                return None
+    if dt.tzinfo is None:
+        return TZ.localize(dt)
+    # If it's already tz-aware, normalize to London then return (we filter in London)
+    return dt.astimezone(TZ)
 
-    dec_odds = parse_odds(odds_s)
-    stake = parse_money(stake_s)
-    if dec_odds is None or stake is None or stake <= 0:
-        await update.message.reply_text("❌ Check odds/stake. Examples: 2.1 or 11/10, stake 25 or £25")
-        return
-
-    if not tipster or tipster.strip() == "":
-        tipster = "Unknown"
-
-    bet_id = uuid.uuid4().hex[:8].upper()
-    now = datetime.now(UK_TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-    try:
-        sheet.append_row(
-            [bet_id, now, "", tipster, selection, dec_odds, bookmaker, stake, "Pending", "", "", ""],
-            value_input_option="USER_ENTERED"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Could not write to Google Sheet: {e}")
-        return
-
-    keyboard = [[
-        InlineKeyboardButton("✅ Win",  callback_data=f"res|{bet_id}|Win"),
-        InlineKeyboardButton("⚪ Void", callback_data=f"res|{bet_id}|Void"),
-        InlineKeyboardButton("❌ Loss", callback_data=f"res|{bet_id}|Loss"),
-    ]]
-    text = (
-        f"✅ Bet logged (ID: {bet_id})\n"
-        f"[{tipster}] {selection} @ {dec_odds:.2f} ({bookmaker}) {fmt_money(stake)}\n"
-        f"Status: Pending"
-    )
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, bet_id, result = query.data.split("|")
-        row = find_row_by_id(bet_id)
-        if not row:
-            await query.edit_message_text("⚠️ Could not find this bet in the sheet.")
-            return
-        values = sheet.row_values(row, value_render_option='UNFORMATTED_VALUE')
-        dec_odds = float(values[5])
-        stake = float(values[7])
-
-        ret, prof = calc_return_profit(result, dec_odds, stake)
-        sheet.update_cell(row, 9, result)          # Status
-        sheet.update_cell(row, 10, f"{ret:.2f}")   # Return
-        sheet.update_cell(row, 11, f"{prof:.2f}")  # Profit
-
-        new_text = (
-            f"📝 Bet (ID: {bet_id})\n"
-            f"[{values[3]}] {values[4]} @ {dec_odds:.2f} ({values[6]}) {fmt_money(stake)}\n"
-            f"Result: {result} • Return: {fmt_money(ret)} • Profit: {fmt_money(prof)}"
-        )
-        await query.edit_message_text(new_text)
-    except Exception as e:
-        await query.edit_message_text(f"⚠️ Error: {e}")
-
-# --------- /summary (P/L per tipster this month) ----------
-def month_bounds_uk(today: Optional[date] = None) -> Tuple[datetime, datetime]:
-    tz = UK_TZ
-    if today is None:
-        today = datetime.now(tz).date()
-    start = datetime(today.year, today.month, 1, 0, 0, 0, tzinfo=tz)
-    if today.month == 12:
-        next_first = datetime(today.year + 1, 1, 1, tzinfo=tz)
-    else:
-        next_first = datetime(today.year, today.month + 1, 1, tzinfo=tz)
-    end = next_first - timedelta(seconds=1)
+def month_bounds_in_london(d=None):
+    now_lon = datetime.now(TZ) if d is None else d.astimezone(TZ)
+    start = TZ.localize(datetime(now_lon.year, now_lon.month, 1))
+    end = (start + relativedelta(months=1))
     return start, end
 
-async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = sheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
-    if not rows or len(rows) <= 1:
-        await update.message.reply_text("No data yet.")
-        return
-    data = rows[1:]  # skip header
+def parse_user_dates(args):
+    """
+    Args can be [], [from], [from, to].
+    Accepts 'YYYY-MM-DD' or 'DD/MM[/YYYY]' or 'DD-MM-YYYY'.
+    Returns (start_in_London_inclusive, end_in_London_exclusive)
+    """
+    if len(args) == 0:
+        return month_bounds_in_london()
 
-    start_dt, end_dt = month_bounds_uk()
-    stats: Dict[str, Dict[str, float]] = {}
-
-    def to_num(x):
-        if isinstance(x, (int, float)):
-            return float(x)
-        s = str(x).replace("£", "").replace(",", "").strip()
+    def parse_one(s):
+        s = s.strip().lower()
+        if s in ("today",):
+            d = datetime.now(TZ)
+            return TZ.localize(datetime(d.year, d.month, d.day))
+        if s in ("yesterday",):
+            d = datetime.now(TZ) - timedelta(days=1)
+            return TZ.localize(datetime(d.year, d.month, d.day))
+        # Try with/without year (assume current year)
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d/%m"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                if fmt == "%d/%m":
+                    dt = dt.replace(year=datetime.now(TZ).year)
+                return TZ.localize(datetime(dt.year, dt.month, dt.day))
+            except ValueError:
+                continue
+        # Fallback parser
         try:
-            return float(s)
+            dt = dtparser.parse(s, dayfirst=True)
+            if dt.tzinfo is None:
+                dt = TZ.localize(datetime(dt.year, dt.month, dt.day))
+            else:
+                dt = dt.astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+            return dt
         except Exception:
-            return 0.0
+            raise ValueError("Use YYYY-MM-DD or DD/MM[/YYYY]")
 
-    for r in data:
-        if len(r) < 12:
-            continue
-        date_placed = to_datetime_uk(r[1])   # Column B
-        tipster = (r[3] or "Unknown").strip()
-        status = (r[8] or "").strip()
-        stake_s, ret_s, prof_s = r[7], r[9], r[10]
+    start = parse_one(args[0])
+    if len(args) >= 2:
+        end_day = parse_one(args[1])
+        end = end_day + timedelta(days=1)  # exclusive
+    else:
+        # end of that month
+        end = (TZ.localize(datetime(start.year, start.month, 1)) + relativedelta(months=1))
+    return start, end
 
-        if status == "" or status.lower() == "pending":
-            continue
-        if not date_placed:
-            continue
-        if not (start_dt <= date_placed <= end_dt):
-            continue
+def fmt_gbp(n):
+    return f"£{n:,.2f}"
 
-        stake = to_num(stake_s)
-        ret = to_num(ret_s)
-        prof = to_num(prof_s)
+def fmt_pct(p):  # p is 0..1
+    return f"{(p*100):.1f}%"
 
-        t = stats.setdefault(tipster, {"bets": 0, "staked": 0.0, "ret": 0.0, "prof": 0.0})
-        t["bets"] += 1
-        t["staked"] += stake
-        t["ret"] += ret
-        t["prof"] += prof
+def load_bets_df():
+    """
+    Reads the Bets sheet into a pandas DataFrame with typed columns.
+    Expected headers (A1:L1):
+    ID | Date Placed | Event Date | Tipster | Selection | Odds (dec) | Bookmaker | Stake | Status | Return | Profit | Cumulative Profit
+    """
+    sh = gc.open(SHEET_NAME)
+    ws = sh.worksheet(SHEET_TAB)
+    rows = ws.get_all_records()  # list of dicts using header row
+    if not rows:
+        return pd.DataFrame(columns=["Date Placed","Tipster","Stake","Status","Return","Profit"])
+    df = pd.DataFrame(rows)
 
-    if not stats:
-        month_name = start_dt.strftime("%B %Y")
-        await update.message.reply_text(f"No settled bets for {month_name}.")
+    # Robust typing
+    # Dates (assume "Date Placed" exists)
+    if "Date Placed" in df.columns:
+        df["Date Placed"] = df["Date Placed"].apply(parse_datetime_london)
+    else:
+        raise RuntimeError("Sheet is missing 'Date Placed' column in header row.")
+
+    # Tipster
+    if "Tipster" not in df.columns:
+        df["Tipster"] = ""
+
+    # Stake/Return/Profit numeric
+    for col in ("Stake", "Return", "Profit"):
+        if col in df.columns:
+            df[col] = df[col].apply(parse_money).astype(float)
+        else:
+            df[col] = 0.0
+
+    # Status
+    if "Status" not in df.columns:
+        df["Status"] = ""
+
+    # Drop rows without a date
+    df = df.dropna(subset=["Date Placed"])
+    return df
+
+def build_summary(df, start_lon, end_lon):
+    """
+    Returns (overall, per_tipster list)
+    overall/per_tipster dict keys: bets, wins, staked, returned, profit, winPct, pending
+    """
+    # Filter window in London tz
+    mask_window = (df["Date Placed"] >= start_lon) & (df["Date Placed"] < end_lon)
+    dfx = df.loc[mask_window].copy()
+
+    # Pending separate
+    settled = dfx[dfx["Status"].isin(["Win","Void","Loss"])]
+    pending = dfx[dfx["Status"] == "Pending"]
+
+    # Aggregation
+    records = []
+    for tip, g in settled.groupby(dfx["Tipster"]):
+        tip = tip or "—"
+        bets = len(g)
+        wins = int((g["Status"] == "Win").sum())
+        staked = float(g["Stake"].sum())
+        # Returned: Win -> Return; Void -> Stake; Loss -> 0
+        returned = float(
+            g.apply(lambda r: r["Return"] if r["Status"] == "Win" else (r["Stake"] if r["Status"] == "Void" else 0.0), axis=1).sum()
+        )
+        # Profit: Void contributes 0; Win/Loss use Profit col
+        profit = float(
+            g.apply(lambda r: 0.0 if r["Status"] == "Void" else r["Profit"], axis=1).sum()
+        )
+        winPct = (wins / bets) if bets > 0 else 0.0
+        pend_ct = int((pending["Tipster"] == tip).sum())
+        records.append(dict(tipster=tip, bets=bets, wins=wins, staked=staked, returned=returned, profit=profit, winPct=winPct, pending=pend_ct))
+
+    # Sort by profit desc
+    records.sort(key=lambda r: r["profit"], reverse=True)
+
+    # Overall
+    overall = {
+        "bets": sum(r["bets"] for r in records),
+        "wins": sum(r["wins"] for r in records),
+        "staked": sum(r["staked"] for r in records),
+        "returned": sum(r["returned"] for r in records),
+        "profit": sum(r["profit"] for r in records),
+        "winPct": (sum(r["wins"] for r in records) / max(1, sum(r["bets"] for r in records))) if sum(r["bets"] for r in records) else 0.0,
+        "pending": int(len(pending)),
+    }
+    return overall, records
+
+def render_summary_text(start_lon, end_lon, overall, per_tipster):
+    lines = []
+    lines.append(f"*Summary* `{start_lon.strftime('%d %b %Y')} — {(end_lon - timedelta(days=1)).strftime('%d %b %Y')}`")
+    lines.append("")
+    lines.append(f"*Overall*  Bets: `{overall['bets']}` | Staked: `{fmt_gbp(overall['staked'])}` | Return: `{fmt_gbp(overall['returned'])}`")
+    lines.append(f"Profit: *{fmt_gbp(overall['profit'])}* | ROI: `{fmt_pct(overall['profit']/overall['staked'] if overall['staked']>0 else 0)}` | Win%: `{fmt_pct(overall['winPct'])}` | Pending: `{overall['pending']}`")
+    lines.append("")
+
+    if not per_tipster:
+        lines.append("_No settled bets in this range._")
+        return "\n".join(lines)
+
+    lines.append("*By Tipster*")
+    for r in per_tipster:
+        lines.append(f"• *{r['tipster']}* — Bets: `{r['bets']}` | Win%: `{fmt_pct(r['winPct'])}` | ROI: `{fmt_pct(r['profit']/r['staked'] if r['staked']>0 else 0)}`")
+        lines.append(f"   Staked: `{fmt_gbp(r['staked'])}` | Return: `{fmt_gbp(r['returned'])}` | Profit: *{fmt_gbp(r['profit'])}*"
+                     + (f" | Pending: `{r['pending']}`" if r['pending'] else ""))
+    return "\n".join(lines)
+
+# --------------------------
+# Commands
+# --------------------------
+@bot.message_handler(commands=["start", "help"])
+def cmd_start(msg):
+    bot.reply_to(msg,
+        "Hi! Use `/summary` to get month-to-date results.\n\n"
+        "Custom ranges:\n"
+        "`/summary 23/09/2025 30/09/2025`\n"
+        "`/summary 23/09`\n"
+        "`/summary 2025-09-23 2025-09-30`\n"
+        "`/summary today`\n",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=["summary"])
+def cmd_summary(msg):
+    try:
+        args = msg.text.split()[1:]
+        start_lon, end_lon = parse_user_dates(args)
+    except Exception:
+        bot.reply_to(msg, "Bad date. Try:\n`/summary 2025-09-23 2025-09-30`\n`/summary 23/09/2025`\n`/summary 23/09`\n`/summary today`")
         return
 
-    items = sorted(stats.items(), key=lambda kv: kv[1]["prof"], reverse=True)
-
-    def fmt_money2(v): return f"£{v:,.2f}"
-    lines: List[str] = []
-    month_name = start_dt.strftime("%B %Y")
-    lines.append(f"Tipster P/L — {month_name}")
-    lines.append("")
-    header = f"{'Tipster':<18} {'Bets':>4} {'Staked':>12} {'Return':>12} {'Profit':>12}"
-    lines.append(header)
-    lines.append("-" * len(header))
-    total_bets = 0
-    total_stake = total_ret = total_prof = 0.0
-    for tip, s in items:
-        lines.append(f"{tip:<18} {s['bets']:>4} {fmt_money2(s['staked']):>12} {fmt_money2(s['ret']):>12} {fmt_money2(s['prof']):>12}")
-        total_bets += s["bets"]; total_stake += s["staked"]; total_ret += s["ret"]; total_prof += s["prof"]
-    lines.append("-" * len(header))
-    lines.append(f"{'Total':<18} {total_bets:>4} {fmt_money2(total_stake):>12} {fmt_money2(total_ret):>12} {fmt_money2(total_prof):>12}")
-
-    await update.message.reply_text("```\n" + "\n".join(lines) + "\n```", parse_mode="Markdown")
-
-# ------------------ MAIN ------------------
-async def _post_init(app: Application):
     try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
+        df = load_bets_df()
+        overall, per_tipster = build_summary(df, start_lon, end_lon)
+        text = render_summary_text(start_lon, end_lon, overall, per_tipster)
+        bot.reply_to(msg, text)
+    except Exception as e:
+        bot.reply_to(msg, f"Summary error: `{e}`")
 
-def main():
-    if not TOKEN:
-        raise RuntimeError("Set TELEGRAM_BOT_TOKEN in your .env or Render env vars.")
-    app = Application.builder().token(TOKEN).post_init(_post_init).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("tipster", tipster_cmd))
-    app.add_handler(CommandHandler("summary", summary_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_bet))
-    app.add_handler(CallbackQueryHandler(button))
-    print("Bot running…")
-    app.run_polling(drop_pending_updates=True)
+@bot.message_handler(commands=["health"])
+def cmd_health(msg):
+    # quick connectivity check
+    try:
+        sh = gc.open(SHEET_NAME)
+        ws = sh.worksheet(SHEET_TAB)
+        _ = ws.acell("A1").value
+        bot.reply_to(msg, "OK")
+    except Exception as e:
+        bot.reply_to(msg, f"Health error: `{e}`")
 
+# --------------------------
+# Run
+# --------------------------
 if __name__ == "__main__":
-    main()
+    print("Bot running…")
+    # For Render/long polling
+    bot.infinity_polling(timeout=60, long_polling_timeout=30)
