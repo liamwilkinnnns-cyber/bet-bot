@@ -2,14 +2,14 @@
 # Sheets-powered Telegram bot: log bets + summaries
 # Commands:
 #   /health
-#   /summary [from] [to]              e.g., /summary 23/09/2025 30/09/2025
-# Free-text bet logging (no command):
+#   /summary [from] [to]              e.g., /summary 23/09/2025 30/09/2025, /summary today
+#   /log Tipster / Selection / Odds / Bookmaker / Stake
+# Free-text logging (DM only):
 #   Tipster / Selection / Odds / Bookmaker / Stake
-#   e.g.,  Lewis / 4 fold acca / 11.50 / Bet365 / 50
 #
-# Env vars:
+# Env vars required:
 #   TELEGRAM_BOT_TOKEN
-#   GOOGLE_CREDS_JSON   (full JSON string of service account)
+#   GOOGLE_CREDS_JSON   (full JSON string of service account; not a file path)
 #   SHEET_NAME          (default: "Bet Tracker")
 #   SHEET_TAB           (default: "Bets")
 
@@ -38,7 +38,10 @@ if not TOKEN:
 creds_json = os.getenv("GOOGLE_CREDS_JSON", "")
 if not creds_json:
     raise RuntimeError("GOOGLE_CREDS_JSON missing (must be the entire JSON string)")
-creds_dict = json.loads(creds_json)
+try:
+    creds_dict = json.loads(creds_json)
+except Exception as e:
+    raise RuntimeError(f"GOOGLE_CREDS_JSON is not valid JSON: {e}")
 
 scopes = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -51,7 +54,7 @@ bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 telebot.logger.setLevel(logging.INFO)
 
 # --------------------------
-# Shared helpers
+# Helpers
 # --------------------------
 _NUM_RE = re.compile(r"[^\d.\-]")  # keep digits, dot, minus
 
@@ -63,13 +66,18 @@ def gen_id():
     return secrets.token_hex(4).upper()  # 8-char hex
 
 def parse_money(x):
-    if x is None: return 0.0
-    if isinstance(x, (int, float)): return float(x)
-    s = str(x).replace("\u00a0", " ").strip()
-    if not s: return 0.0
-    s = s.replace("£", "").replace(",", "")
+    """'£1,250.50' -> 1250.50; robust to weird inputs."""
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).replace("\u00a0", " ").strip()  # nbsp
+    if not s:
+        return 0.0
+    s = s.replace(",", "").replace("£", "")
     parts = s.split(".")
-    if len(parts) > 2: s = "".join(parts[:-1]) + "." + parts[-1]
+    if len(parts) > 2:
+        s = "".join(parts[:-1]) + "." + parts[-1]
     try:
         return float(s)
     except ValueError:
@@ -78,14 +86,13 @@ def parse_money(x):
 
 def parse_odds_to_decimal(s):
     """
-    Accepts:
-      - decimal with dot/comma: '2.1', '11,50'
-      - fractional: '5/2', '11/10'
+    Accept:
+      - fractional 'a/b' -> 1 + a/b   (e.g., 5/2 -> 3.5)
+      - decimal with . or , (e.g., 2.1, 11,50)
     Returns float > 1.0
     """
     raw = str(s).strip()
     if "/" in raw:
-        # fractional a/b => 1 + a/b
         try:
             a, b = raw.split("/", 1)
             dec = 1.0 + (float(a.strip()) / float(b.strip()))
@@ -93,7 +100,6 @@ def parse_odds_to_decimal(s):
             return dec
         except Exception:
             raise ValueError(f"Bad fractional odds: {s}")
-    # decimal
     raw = raw.replace(",", ".")
     try:
         dec = float(raw)
@@ -103,6 +109,7 @@ def parse_odds_to_decimal(s):
         raise ValueError(f"Bad decimal odds: {s}")
 
 def parse_datetime_london(s):
+    """Parse Sheet date/time into tz-aware Europe/London datetime (or None)."""
     if isinstance(s, datetime):
         dt = s
     else:
@@ -134,8 +141,14 @@ def month_bounds_in_london(d=None):
     return start, end
 
 def parse_user_dates(args):
+    """
+    Args: [], [from], [from, to]
+    Accepts 'YYYY-MM-DD', 'DD/MM[/YYYY]', 'DD-MM-YYYY', 'today', 'yesterday'
+    Returns (start_inclusive, end_exclusive) as tz-aware London datetimes.
+    """
     if len(args) == 0:
         return month_bounds_in_london()
+
     def parse_one(s):
         s = s.strip().lower()
         if s == "today":
@@ -150,21 +163,24 @@ def parse_user_dates(args):
                 return TZ.localize(datetime(dt.year, dt.month, dt.day))
             except ValueError:
                 continue
+        # fallback
         dt = dtparser.parse(s, dayfirst=True)
         if dt.tzinfo is None:
             dt = TZ.localize(datetime(dt.year, dt.month, dt.day))
         else:
             dt = dt.astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
         return dt
+
     start = parse_one(args[0])
     if len(args) >= 2:
-        end_day = parse_one(args[1]); end = end_day + timedelta(days=1)
+        end_day = parse_one(args[1])
+        end = end_day + timedelta(days=1)  # exclusive
     else:
         end = TZ.localize(datetime(start.year, start.month, 1)) + relativedelta(months=1)
     return start, end
 
 def fmt_gbp(n): return f"£{n:,.2f}"
-def fmt_pct(p): return f"{(p*100):.1f}%"
+def fmt_pct(p): return f"{(p*100):.1f}%"  # p is 0..1
 
 # --------------------------
 # Sheets I/O
@@ -175,7 +191,7 @@ def ws_open():
 
 def append_bet_row(tipster, selection, odds_dec, bookmaker, stake, event_dt=None):
     """
-    Appends a row with the app's schema:
+    Appends a row with the schema:
     ID | Date Placed | Event Date | Tipster | Selection | Odds (dec) | Bookmaker | Stake | Status | Return | Profit | Cumulative Profit
     """
     ws = ws_open()
@@ -195,9 +211,8 @@ def append_bet_row(tipster, selection, odds_dec, bookmaker, stake, event_dt=None
         "Pending",
         "",  # Return
         "",  # Profit
-        ""   # Cumulative Profit (left to sheet/formula)
+        ""   # Cumulative Profit
     ]
-    # USER_ENTERED so numbers/dates format nicely in Sheets
     ws.append_row(row, value_input_option="USER_ENTERED")
     return bet_id
 
@@ -280,18 +295,50 @@ def send_long_message(chat_id, text, chunk_size=3900):
     if buf: bot.send_message(chat_id, "\n".join(buf))
 
 # --------------------------
+# Bet logging helpers
+# --------------------------
+def process_bet_line(line: str):
+    """
+    Parse 'Tipster / Selection / Odds / Bookmaker / Stake'
+    Returns (bet_id, tipster, selection, odds_dec, bookmaker, stake)
+    """
+    # Allow sloppy spacing; split on '/'
+    parts = [p.strip() for p in line.split("/")]
+    # Remove empty segments caused by ' / '
+    parts = [p for p in parts if p != ""]
+    if len(parts) != 5:
+        raise ValueError("Please send: Tipster / Selection / Odds / Bookmaker / Stake")
+
+    tipster, selection, odds_raw, bookmaker, stake_raw = parts
+    odds_dec = parse_odds_to_decimal(odds_raw)
+    stake = parse_money(stake_raw)
+    if stake <= 0:
+        raise ValueError("Stake must be greater than 0")
+
+    bet_id = append_bet_row(
+        tipster=tipster,
+        selection=selection,
+        odds_dec=odds_dec,
+        bookmaker=bookmaker,
+        stake=stake,
+        event_dt=None
+    )
+    return bet_id, tipster, selection, odds_dec, bookmaker, stake
+
+# --------------------------
 # Commands & Handlers
 # --------------------------
 @bot.message_handler(commands=["start","help"])
 def cmd_start(msg):
     bot.reply_to(msg,
         "Log a bet by sending:\n"
-        "`Tipster / Selection / Odds / Bookmaker / Stake`\n"
-        "_Example:_  `Lewis / 4 fold acca / 11.50 / Bet365 / 50`\n\n"
+        "`/log Tipster / Selection / Odds / Bookmaker / Stake`\n"
+        "_Example:_  `/log Lewis / 4 fold acca / 11.50 / Bet365 / 50`\n\n"
+        "Or (in DM with the bot only), just paste the line without /log.\n\n"
         "Summaries:\n"
         "`/summary` (this month)\n"
         "`/summary 23/09`  or  `/summary 23/09/2025 30/09/2025`\n"
-        "`/summary today`\n"
+        "`/summary today`"
     )
 
 # Summary (catches /summary and /summary@BotName)
@@ -327,35 +374,21 @@ def cmd_health(msg):
     except Exception as e:
         bot.reply_to(msg, f"Health error: `{e}`")
 
-# --- NEW: Free-text bet logger ---
-BET_LINE_RE = re.compile(r"\s*/\s*")  # split on slashes with optional spaces
-
-@bot.message_handler(func=lambda m: bool(m.text) and "/" in m.text and not m.text.startswith("/"))
-def log_bet_free_text(msg):
-    """
-    Accepts: Tipster / Selection / Odds / Bookmaker / Stake
-    Example: Lewis / 4 fold acca / 11.50 / Bet365 / 50
-    """
-    try:
-        parts = [p.strip() for p in BET_LINE_RE.split(msg.text)]
-        if len(parts) != 5:
-            bot.reply_to(msg, "Please send: `Tipster / Selection / Odds / Bookmaker / Stake`\nExample: `Lewis / 4 fold acca / 11.50 / Bet365 / 50`")
-            return
-        tipster, selection, odds_raw, bookmaker, stake_raw = parts
-        odds_dec = parse_odds_to_decimal(odds_raw)
-        stake = parse_money(stake_raw)
-        if stake <= 0:
-            bot.reply_to(msg, "Stake must be greater than 0."); return
-
-        bot.send_chat_action(msg.chat.id, "typing")
-        bet_id = append_bet_row(
-            tipster=tipster,
-            selection=selection,
-            odds_dec=odds_dec,
-            bookmaker=bookmaker,
-            stake=stake,
-            event_dt=None  # can be extended later
+# Log via command (works in groups even with privacy ON)
+# Usage: /log Lewis / 4 fold acca / 11.50 / Bet365 / 50
+@bot.message_handler(commands=["log"])
+def cmd_log(msg):
+    # Everything after the command
+    line = msg.text.split(" ", 1)[1].strip() if len(msg.text.split(" ", 1)) > 1 else ""
+    if not line:
+        bot.reply_to(msg,
+            "Usage:\n`/log Tipster / Selection / Odds / Bookmaker / Stake`\n"
+            "Example:\n`/log Lewis / 4 fold acca / 11.50 / Bet365 / 50`"
         )
+        return
+    try:
+        bot.send_chat_action(msg.chat.id, "typing")
+        bet_id, tipster, selection, odds_dec, bookmaker, stake = process_bet_line(line)
         bot.reply_to(
             msg,
             f"✅ *Logged*\n"
@@ -366,7 +399,25 @@ def log_bet_free_text(msg):
             f"Status: `Pending`"
         )
     except Exception as e:
-        bot.reply_to(msg, f"Could not log that bet: `{e}`\nSend like: `Lewis / 4 fold acca / 11.50 / Bet365 / 50`")
+        bot.reply_to(msg, f"Could not log that bet: `{e}`\n\nTry:\n`/log Lewis / 4 fold acca / 11.50 / Bet365 / 50`")
+
+# DM free-text logging (paste line without /log) — only in private chat
+@bot.message_handler(func=lambda m: m.chat.type == "private" and bool(m.text) and "/" in m.text and not m.text.startswith("/"))
+def log_bet_free_text_dm(msg):
+    try:
+        bot.send_chat_action(msg.chat.id, "typing")
+        bet_id, tipster, selection, odds_dec, bookmaker, stake = process_bet_line(msg.text)
+        bot.reply_to(
+            msg,
+            f"✅ *Logged*\n"
+            f"ID: `{bet_id}`\n"
+            f"Tipster: *{tipster}*\n"
+            f"Selection: `{selection}`\n"
+            f"Odds: `{odds_dec:.2f}`  |  Bookmaker: `{bookmaker}`  |  Stake: `{fmt_gbp(stake)}`\n"
+            f"Status: `Pending`"
+        )
+    except Exception as e:
+        bot.reply_to(msg, f"Could not log that bet: `{e}`\nSend like:\n`Tipster / Selection / Odds / Bookmaker / Stake`")
 
 # --------------------------
 # Run (single instance, auto-retry)
@@ -374,18 +425,19 @@ def log_bet_free_text(msg):
 if __name__ == "__main__":
     print("Bot starting…")
     try:
-        bot.delete_webhook(drop_pending_updates=True)
+        bot.delete_webhook(drop_pending_updates=True)  # ensure polling receives updates
         print("Webhook cleared.")
     except Exception as e:
         print("delete_webhook error:", e)
 
-    time.sleep(2)
+    time.sleep(2)  # let Telegram release any previous long-poll
     while True:
         try:
             bot.infinity_polling(timeout=60, long_polling_timeout=30, skip_pending=True, logger_level=logging.INFO)
         except ApiTelegramException as e:
+            # If another instance is running, wait and retry
             if getattr(e, "result", None) is not None and getattr(e.result, "status_code", None) == 409:
-                print("409 Conflict (other getUpdates). Retrying in 10s…")
+                print("409 Conflict (another getUpdates). Retrying in 10s…")
                 time.sleep(10)
                 continue
             print("Telegram API error:", e)
